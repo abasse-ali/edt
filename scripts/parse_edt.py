@@ -17,10 +17,15 @@ MOIS = {
 
 def download_pdf(url, filename="temp.pdf"):
     print(f"Téléchargement de {url}...")
-    response = requests.get(url)
-    with open(filename, 'wb') as f:
-        f.write(response.content)
-    return filename
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        with open(filename, 'wb') as f:
+            f.write(response.content)
+        return filename
+    except Exception as e:
+        print(f"Erreur téléchargement: {e}")
+        return None
 
 def get_anchors(page):
     words = page.extract_words()
@@ -34,9 +39,9 @@ def get_anchors(page):
     
     if x_8h and x_9h:
         pixels_per_hour = x_9h - x_8h
-        start_grid_x = x_8h - (pixels_per_hour * 0.25) # Commence à 7h45
+        start_grid_x = x_8h - (pixels_per_hour * 0.25) # 7h45
     else:
-        print("WARN: Calibration auto échouée, valeurs par défaut.")
+        # Valeurs par défaut (fallback)
         pixels_per_hour = 100 
         start_grid_x = 50
 
@@ -44,7 +49,6 @@ def get_anchors(page):
     week_anchors = []
     current_year = datetime.now().year 
     
-    # Regex pour trouver "12/janv"
     date_pattern = re.compile(r"(\d{1,2})/([a-zéû]+)")
     
     for w in words:
@@ -54,9 +58,7 @@ def get_anchors(page):
             month_str = match.group(2)
             month_num = MOIS.get(month_str, 1)
             
-            # Gestion année scolaire (si on est en janvier 2025, le pdf est bon)
-            # Si le mois détecté est Septembre/Octobre, c'est l'année N-1 si on est en Janvier
-            # Pour l'instant on garde simple : année courante système
+            # Gestion simple de l'année
             dt = datetime(current_year, month_num, day_num)
             
             week_anchors.append({
@@ -68,32 +70,32 @@ def get_anchors(page):
     return start_grid_x, pixels_per_hour, week_anchors
 
 def clean_text(text):
-    """Sépare le Titre du cours et la Salle intelligemment"""
+    """Sépare le Titre du cours et la Salle"""
     lines = [line.strip() for line in text.split('\n') if line.strip()]
     
     if not lines:
-        return "Cours Inconnu", ""
+        return "Cours", ""
 
-    # Mots clés qui indiquent une salle
-    room_keywords = ["U3-", "Amphi", "U6-", "K01", "Labo", "Salle", "U4-"]
+    # Mots clés étendus pour détecter les salles
+    room_keywords = ["U3-", "Amphi", "U6-", "K01", "Labo", "Salle", "U4-", "J3-", "L3-"]
     
     title_parts = []
     location_parts = []
     
     for line in lines:
-        # Si la ligne ressemble à une salle, on la met dans location
+        # Si la ligne contient un mot clé de salle -> Location
         if any(k in line for k in room_keywords):
             location_parts.append(line)
         else:
-            # Sinon c'est le titre ou le prof
+            # Sinon -> Titre
             title_parts.append(line)
     
     summary = " ".join(title_parts)
     location = " ".join(location_parts)
     
-    # Fallback : Si on n'a rien trouvé en titre, on prend tout
-    if not summary:
-        summary = location
+    # Sécurité : Si aucun titre trouvé (tout a été détecté comme salle ?)
+    if not summary and location:
+        summary = location # On remet la salle en titre faute de mieux
         location = ""
         
     return summary, location
@@ -105,12 +107,11 @@ def parse_pdf(pdf_path):
         for page in pdf.pages:
             start_x, px_per_h, weeks = get_anchors(page)
             weeks.sort(key=lambda x: x['top'])
+            
             rects = page.rects
             
             for rect in rects:
                 if not rect.get('non_stroking_color'): continue
-                
-                # Ignorer les trop petits
                 if rect['height'] < 10 or rect['width'] < 10: continue
 
                 r_top = rect['top']
@@ -118,24 +119,20 @@ def parse_pdf(pdf_path):
                 # Identifier la semaine
                 ref_week = None
                 for i, w in enumerate(weeks):
+                    # Zone de tolérance pour la semaine
                     next_w_top = weeks[i+1]['top'] if i+1 < len(weeks) else 9999
-                    if w['top'] - 20 <= r_top < next_w_top - 20:
+                    if w['top'] - 50 <= r_top < next_w_top - 50:
                         ref_week = w
                         break
                 
                 if not ref_week: continue
 
-                # Identifier le jour (Lundi=0, Mardi=1...)
+                # Identifier le jour
                 delta_y = r_top - ref_week['top']
-                # Ajustement hauteur approximative d'une ligne jour (environ 30-40px selon PDF)
-                # On divise la hauteur de semaine par 5 jours
-                week_height = (weeks[1]['top'] - weeks[0]['top']) if len(weeks) > 1 else 200
-                day_height = week_height / 5 # Approximation grossière mais souvent suffisante
-                
-                # Alternative plus simple basée sur l'image :
-                # Lundi est tout en haut. Chaque jour fait environ 35px de haut.
+                # Estimation : ~35px par jour (à affiner si besoin)
                 day_index = int(delta_y / 35) 
                 if day_index > 4: day_index = 4
+                if day_index < 0: day_index = 0
                 
                 course_date = ref_week['date'] + timedelta(days=day_index)
 
@@ -145,6 +142,7 @@ def parse_pdf(pdf_path):
                 
                 start_h = int(start_hour_decimal)
                 start_m = int((start_hour_decimal - start_h) * 60)
+                # Arrondi 5 min
                 start_m = round(start_m / 5) * 5
                 if start_m == 60:
                     start_h += 1; start_m = 0
@@ -152,8 +150,15 @@ def parse_pdf(pdf_path):
                 start_dt = course_date.replace(hour=start_h, minute=start_m)
                 end_dt = start_dt + timedelta(hours=duration_hours)
 
-                # Extraction Texte
-                cropped = page.crop((rect['x0'], rect['top'], rect['x0'] + rect['width'], rect['bottom']))
+                # --- CORRECTION MAJEURE ICI : MARGES ---
+                # On élargit la zone de crop de 2 pixels de chaque côté
+                # pour être sûr d'attraper le texte qui dépasse
+                x0 = max(0, rect['x0'] - 2)
+                top = max(0, rect['top'] - 2)
+                x1 = min(page.width, rect['x0'] + rect['width'] + 2)
+                bottom = min(page.height, rect['bottom'] + 2)
+                
+                cropped = page.crop((x0, top, x1, bottom))
                 raw_text = cropped.extract_text()
                 
                 if raw_text and len(raw_text.strip()) > 1:
@@ -170,14 +175,12 @@ def parse_pdf(pdf_path):
     return calendar
 
 def main():
-    try:
-        pdf_file = download_pdf(PDF_URL)
+    pdf_file = download_pdf(PDF_URL)
+    if pdf_file:
         cal = parse_pdf(pdf_file)
         with open(OUTPUT_FILE, 'w') as f:
             f.writelines(cal.serialize())
-        print(f"Succès ! {len(cal.events)} événements créés.")
-    except Exception as e:
-        print(f"Erreur : {e}")
+        print(f"Succès ! {len(cal.events)} événements générés.")
 
 if __name__ == "__main__":
     main()
