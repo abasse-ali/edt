@@ -1,35 +1,36 @@
-name: Mise à jour EDT STRI
+name: Update EDT Calendar
 
 on:
   schedule:
-    - cron: '0 5 * * *' # Tous les jours à 5h00 UTC (6h ou 7h en France)
-  workflow_dispatch:      # Permet de lancer manuellement le script
-
-permissions:
-  contents: write         # Donne la permission de sauvegarder le fichier .ics
+    - cron: '0 5 * * *' # Tous les jours à 05h00 UTC (06h00 France)
+  workflow_dispatch: # Permet de lancer manuellement pour tester
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    
     steps:
-      - name: Checkout du code
+      - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Configurer Python
+      - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
 
-      - name: Installer les dépendances
-        run: pip install -r requirements.txt
-
-      - name: Lancer la conversion
-        run: python scripts/parse_edt.py
-
-      - name: Sauvegarder le fichier .ics (Git Push)
+      - name: Install dependencies
         run: |
-          git config --global user.name "GitHub Action"
-          git config --global user.email "action@github.com"
-          git add edt_stri.ics
-          # Ne commit que s'il y a des changements
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Mise à jour EDT $(date +'%Y-%m-%d')" && git push)
+          pip install requests pdfplumber ics pytz
+
+      - name: Create output directory
+        run: mkdir -p public
+
+      - name: Run script
+        run: python main.py
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./public
+          keep_files: true
