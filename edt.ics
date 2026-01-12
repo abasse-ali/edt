@@ -1,0 +1,11 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:ics.py - http://git.io/lLljaA
+BEGIN:VEVENT
+DESCRIPTION:CPO Mercredi PT CPO (AnAn) Jeudi Projet informatique (BA) Informatique (Algo+Python) Vendredi AA 8h 4 19/janv CPO /GA (AnAn) Lundi Informatique (OM) / GB Mardi Projet informatique (BA) Mercredi Informatique (TD/TP Python) Jeudi AA/OM/PB TCP/IP Vendredi AA 5 8h CPO /TP/GA (AnAn) 26/janv Lundi Réseaux d'opérateurs (AA) Mardi Anglais CPO Mercredi PT CPO (AnAn) Jeudi TCP/IP Vendredi Anglais 6 8h CPO /TP/GA (AnAn) 02/févr Lundi Gest. de Projets (AA) Mardi Anglais CPO Mercredi PT Jeudi Télécoms (JGT) SHS Vendredi
+DTEND:20250112T134533Z
+DTSTART:20250112T064500Z
+SUMMARY:CPO Mercredi PT CPO (Andréi ANDRÉI) Jeudi Projet informatique (BA) Informatique (Algo+Python) Vendredi AA 8h 4 19/janv CPO /GA (Andréi ANDRÉI) Lundi Informatique (Olfa MECHI) / GB Mardi Projet informatique (BA) Mercredi Informatique (TD/TP Python) Jeudi AA/OM/PB TCP/IP Vendredi AA 5 8h CPO /TP/GA (Andréi ANDRÉI) 26/janv Lundi Réseaux d'opérateurs (André AOUN) Mardi Anglais CPO Mercredi PT CPO (Andréi ANDRÉI) Jeudi TCP/IP Vendredi Anglais 6 8h CPO /TP/GA (Andréi ANDRÉI) 02/févr Lundi Gest. de Projets (André AOUN) Mardi Anglais CPO Mercredi PT Jeudi Télécoms (Jean-Guy TARTARIN) SHS Vendredi
+UID:0d67a0c0-425b-49eb-9f5d-840780ea4ba8@0d67.org
+END:VEVENT
+END:VCALENDAR
