@@ -26,7 +26,7 @@ jobs:
         run: mkdir -p public
 
       - name: Run script
-        run: python main.py
+        run: python /scripts/main.py
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
