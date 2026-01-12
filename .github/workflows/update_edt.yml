@@ -3,7 +3,7 @@ name: Update EDT
 on:
   schedule:
     # Tourne tous les jours à 6h00 du matin UTC
-    - cron: '0 6 * * *'
+    - cron: '0 5 * * *'
   workflow_dispatch: # Permet de lancer manuellement pour tester
 
 jobs:
