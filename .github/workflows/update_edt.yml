@@ -28,7 +28,7 @@ jobs:
       - name: Run parser script
         run: python edt_parser.py
 
-            - name: Commit and push changes
+      - name: Commit and push changes
         run: |
           git config --global user.name 'GitHub Action'
           git config --global user.email 'action@github.com'
