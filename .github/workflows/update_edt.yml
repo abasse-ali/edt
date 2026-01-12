@@ -28,9 +28,21 @@ jobs:
       - name: Run parser script
         run: python edt_parser.py
 
-      - name: Commit and push changes
+            - name: Commit and push changes
         run: |
           git config --global user.name 'GitHub Action'
           git config --global user.email 'action@github.com'
           git add edt.ics
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Mise à jour automatique EDT" && git push)
+          
+          # Vérifie s'il y a des changements préparés
+          if git diff --staged --quiet; then
+            echo "Aucun changement à sauvegarder."
+          else
+            git commit -m "Mise à jour automatique EDT"
+            
+            # --- LA CORRECTION EST ICI ---
+            # On récupère les dernières modifications du serveur avant de pousser
+            git pull --rebase origin main
+            
+            git push origin main
+          fi
