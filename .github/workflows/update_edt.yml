@@ -1,16 +1,19 @@
-name: Update EDT Calendar
+name: Update EDT
 
 on:
   schedule:
-    - cron: '0 5 * * *' # Tous les jours à 05h00 UTC (06h00 France)
+    # Tourne tous les jours à 6h00 du matin UTC
+    - cron: '0 6 * * *'
   workflow_dispatch: # Permet de lancer manuellement pour tester
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    
+    permissions:
+      contents: write # Important pour pouvoir push le fichier .ics
+
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v3
 
       - name: Set up Python
@@ -20,17 +23,14 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests pdfplumber ics pytz
+          pip install -r requirements.txt
 
-      - name: Create output directory
-        run: mkdir -p public
+      - name: Run parser script
+        run: python edt_parser.py
 
-      - name: Run script
-        run: python /scripts/main.py
-
-      - name: Deploy to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v3
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./public
-          keep_files: true
+      - name: Commit and push changes
+        run: |
+          git config --global user.name 'GitHub Action'
+          git config --global user.email 'action@github.com'
+          git add edt.ics
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Mise à jour automatique EDT" && git push)
