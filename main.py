@@ -22,40 +22,46 @@ OM=Olfa MECHI; PA=Patrick AUSTIN; PhA=Philippe ARGUEL; PIL=Pierre LOTTE; PL=Phil
 RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Thierry DESPRATS; TG=Thierry GAYRAUD.
 """
 
-def get_stable_model_name():
-    """Sélectionne le modèle le plus sûr pour le Free Tier."""
+def get_best_model_name():
+    """Sélectionne le modèle avec le meilleur quota gratuit."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
     try:
         response = requests.get(url)
         if response.status_code != 200:
-            return "gemini-1.5-flash"
+            return "gemini-flash-latest"
 
         data = response.json()
         available = [m['name'].replace('models/', '') for m in data.get('models', []) if 'generateContent' in m.get('supportedGenerationMethods', [])]
         
-        print(f"📋 Modèles trouvés : {available}")
+        print(f"📋 Modèles disponibles : {available}")
 
-        # ORDRE CHANGÉ : On met 1.5 Flash en PREMIER car son quota est le plus fiable (15 RPM)
-        # Les versions 2.0 sont souvent limitées en 'preview'
+        # ORDRE DE PRIORITÉ CRUCIAL :
+        # 1. 'gemini-flash-latest' : L'alias stable standard (souvent 1.5 Flash). Gros quota.
+        # 2. 'gemini-1.5-flash' : Le nom technique explicite.
+        # 3. 'gemini-2.5-flash' : Nouvelle version, peut-être bon quota, à tester en repli.
         preferences = [
-            "gemini-1.5-flash",          # LE PLUS STABLE
-            "gemini-1.5-flash-latest",
+            "gemini-flash-latest",       # PRIORITÉ 1 (C'est celui qu'on veut !)
+            "gemini-1.5-flash",          # PRIORITÉ 2
+            "gemini-1.5-flash-latest",   
             "gemini-1.5-flash-001",
-            "gemini-2.0-flash-lite-preview-02-05",
-            "gemini-2.0-flash",
-            "gemini-1.5-pro",
+            "gemini-2.5-flash",          # Repli possible
         ]
 
         for pref in preferences:
             if pref in available:
-                print(f"✅ Modèle choisi (Quota Friendly) : {pref}")
+                print(f"✅ Modèle choisi (Quota Max) : {pref}")
                 return pref
         
-        return "gemini-1.5-flash"
+        # Si aucun des favoris n'est là, on prend le premier qui contient 'flash'
+        for m in available:
+            if 'flash' in m and 'exp' not in m and 'preview' not in m:
+                return m
+                
+        return "gemini-flash-latest"
 
     except Exception as e:
         print(f"Erreur choix modèle : {e}")
-        return "gemini-1.5-flash"
+        return "gemini-flash-latest"
 
 def clean_json_text(text):
     text = re.sub(r"```json|```", "", text).strip()
@@ -75,9 +81,9 @@ def get_schedule_from_gemini(image, model_name):
     current_year = datetime.now().year
     
     prompt = f"""
-    Analyse cette image d'emploi du temps (Groupe GB).
+    Analyse l'emploi du temps (image) pour le groupe "GB".
     
-    RÈGLES VISUELLES :
+    RÈGLES :
     1. Si 2 lignes/jour, ignore la ligne du haut.
     2. Ignore les cours "/GC". Garde "/GB" ou sans groupe.
     3. Ignore cases ORANGE.
@@ -107,17 +113,15 @@ def get_schedule_from_gemini(image, model_name):
         ]
     }
 
-    # RETRY AGRESSIF (Délais augmentés)
-    max_retries = 3
+    # RETRY LIMITÉ (On n'insiste pas si c'est cassé pour éviter de bloquer le compte)
+    max_retries = 2
     for attempt in range(max_retries):
         try:
             response = requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
             
             if response.status_code == 429:
-                # On augmente le temps d'attente à chaque échec (60s, 120s...)
-                wait_time = 60 * (attempt + 1)
-                print(f"⚠️ Quota dépassé. Attente {wait_time}s... (Essai {attempt+1}/{max_retries})")
-                time.sleep(wait_time)
+                print(f"⚠️ Quota dépassé. Attente 30s... (Essai {attempt+1}/{max_retries})")
+                time.sleep(30)
                 continue
             
             if response.status_code != 200:
@@ -163,16 +167,15 @@ def create_ics_file(events):
 def main():
     if not API_KEY: raise Exception("Clé API manquante")
 
-    model_name = get_stable_model_name()
+    model_name = get_best_model_name()
     print(f"🚀 Démarrage avec : {model_name}")
 
     print("Téléchargement PDF...")
     response = requests.get(PDF_URL)
     
-    # MODIFICATION IMPORTANTE : DPI passé de 300 à 200
-    # Cela réduit la taille de l'image de 50%, donc consomme MOINS de quota.
-    print("Conversion PDF -> Images (Mode Éco)...")
-    images = convert_from_bytes(response.content, dpi=200) 
+    # DPI 150 : Qualité "Fax". Suffisant pour le texte, très léger pour l'API.
+    print("Conversion PDF -> Images (Mode Ultra-Léger 150 DPI)...")
+    images = convert_from_bytes(response.content, dpi=150) 
 
     all_events = []
     print(f"Traitement de {len(images)} pages...")
