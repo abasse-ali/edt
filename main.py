@@ -21,44 +21,23 @@ OM=Olfa MECHI; PA=Patrick AUSTIN; PhA=Philippe ARGUEL; PIL=Pierre LOTTE; PL=Phil
 RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Thierry DESPRATS; TG=Thierry GAYRAUD.
 """
 
-def get_best_model_name():
-    """Sélectionne le meilleur modèle disponible (2.0/2.5 > Pro > Flash)."""
+def get_available_models():
+    """Récupère la liste de TOUS les modèles disponibles pour votre clé."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
     try:
         response = requests.get(url)
         if response.status_code != 200:
-            return "gemini-1.5-flash"
-
+            return []
         data = response.json()
-        available = [m['name'].replace('models/', '') for m in data.get('models', [])]
-        print(f"📋 Modèles dispo : {available}")
-
-        # ORDRE DE PRIORITÉ BASÉ SUR VOS LOGS
-        preferences = [
-            "gemini-2.0-flash",       # Excellent compromis vitesse/intelligence
-            "gemini-2.5-flash",       # Nouvelle génération
-            "gemini-1.5-pro",         # Très intelligent
-            "gemini-1.5-pro-latest",
-            "gemini-flash-latest"     # Fallback
-        ]
-
-        for pref in preferences:
-            if pref in available:
-                print(f"✅ Modèle CHOISI : {pref}")
-                return pref
-        
-        return "gemini-1.5-flash"
-
-    except Exception:
-        return "gemini-1.5-flash"
+        return [m['name'].replace('models/', '') for m in data.get('models', [])]
+    except:
+        return []
 
 def clean_json_text(text):
-    # On cherche le premier '[' et le dernier ']'
     start = text.find('[')
     end = text.rfind(']')
     if start != -1 and end != -1:
         return text[start:end+1]
-    # Si échec, on tente de nettoyer le markdown
     text = re.sub(r"```json|```", "", text).strip()
     return text
 
@@ -70,21 +49,18 @@ def call_gemini_api(image, model_name):
     b64_data = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
 
     prompt = f"""
-    Analyse l'emploi du temps pour le groupe "GB".
-    ANNÉE : 2026 (Force cette année).
+    Analyse l'emploi du temps (Groupe GB).
+    ANNÉE : 2026.
 
     RÈGLES VISUELLES :
-    1. **LIGNES COUPÉES** : Si une ligne de jour est divisée en deux (Haut/Bas) :
-       - HAUT = Groupe GA/G1 -> IGNORE.
-       - BAS = Groupe GB/G2 -> LIS CE COURS.
-    2. **FILTRE COULEUR** : IGNORE les cases ORANGES/JAUNES (Examens/Admin). Lis les blanches.
-    3. **FILTRE GROUPE** : Garde uniquement "/GB" ou sans groupe. Ignore "/GC".
+    1. **LIGNES** : Si une journée a 2 lignes, IGNORE celle du HAUT (GA). LIS celle du BAS (GB).
+    2. **COULEUR** : IGNORE les cases ORANGES. Lis les BLANCHES.
+    3. **GROUPE** : Garde uniquement "/GB" ou sans groupe.
     4. **HORAIRES** :
-       - Matin : 07h45-09h45 et 10h00-12h00.
-       - Après-midi : **13h30**-15h30 et 15h45-17h45.
-       (Attention : l'après-midi commence souvent à la 2ème graduation après 13h).
+       - Matin : 07h45-09h45 / 10h00-12h00
+       - Aprèm : 13h30-15h30 / 15h45-17h45 (décalage possible)
 
-    FORMAT DE SORTIE : Une LISTE JSON unique contenant tous les cours de la page.
+    FORMAT DE SORTIE (Liste JSON) :
     [
       {{
         "date": "2026-MM-JJ",
@@ -94,7 +70,7 @@ def call_gemini_api(image, model_name):
         "location": "Salle"
       }}
     ]
-    Remplace les profs par : {PROFS_DICT}
+    Profs: {PROFS_DICT}
     """
 
     payload = {
@@ -111,37 +87,59 @@ def call_gemini_api(image, model_name):
     return requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
 
 def get_schedule_robust(image):
-    model_name = get_best_model_name()
+    # 1. On récupère ce qu'on a le droit d'utiliser
+    available = get_available_models()
     
-    # 3 Tentatives en cas de crash
-    for attempt in range(3):
+    # 2. LISTE DE PRIORITÉ (Cascading Failover)
+    # On commence par le plus intelligent (2.0), si ça bloque -> 1.5 Flash (Fiable) -> etc.
+    priority_list = [
+        "gemini-2.0-flash",       # Intelligent mais quota faible
+        "gemini-1.5-flash",       # Le "tank" : quota énorme (15 RPM)
+        "gemini-flash-latest",    # Alias pour 1.5 Flash
+        "gemini-1.5-pro",         # Lent mais précis
+        "gemini-2.0-flash-lite-preview-02-05"
+    ]
+
+    # On filtre pour ne garder que ceux qui existent vraiment pour votre clé
+    models_to_try = [m for m in priority_list if m in available]
+    
+    # Si la liste est vide (erreur API models), on force une liste par défaut
+    if not models_to_try:
+        models_to_try = ["gemini-1.5-flash", "gemini-flash-latest"]
+
+    print(f"   📋 Stratégie de secours : {models_to_try}")
+
+    for model in models_to_try:
+        print(f"   👉 Tentative avec : {model}...")
+        
+        # Une seule tentative par modèle (pas de retry si 429, on change direct de modèle)
         try:
-            print(f"   👉 Tentative {attempt+1} avec {model_name}...")
-            response = call_gemini_api(image, model_name)
+            response = call_gemini_api(image, model)
 
             if response.status_code == 200:
                 raw_resp = response.json()
                 if 'candidates' in raw_resp and raw_resp['candidates']:
-                    # Nettoyage robuste pour éviter l'erreur "Extra data"
                     clean = clean_json_text(raw_resp['candidates'][0]['content']['parts'][0]['text'])
                     return json.loads(clean)
                 else:
                     print("      ⚠️ Réponse vide.")
             
-            elif response.status_code in [429, 503]:
-                wait = (attempt + 1) * 20
-                print(f"      ⚠️ Surcharge ({response.status_code}). Pause {wait}s...")
-                time.sleep(wait)
+            elif response.status_code == 429:
+                print("      ⚠️ Quota dépassé (429). Passage immédiat au modèle suivant...")
+                continue # On passe au prochain modèle de la liste
+            
+            elif response.status_code == 503:
+                print("      ⚠️ Surcharge Google (503). Passage au suivant...")
                 continue
+
             else:
                 print(f"      ❌ Erreur {response.status_code}.")
-                return []
 
         except Exception as e:
-            print(f"      ❌ Erreur technique : {e}")
-            # Si erreur JSON, on réessaie peut-être que l'IA fera mieux la prochaine fois
+            print(f"      ❌ Exception : {e}")
             continue
-            
+
+    print("❌ ECHEC TOTAL : Aucun modèle n'a fonctionné.")
     return []
 
 def create_ics_file(events):
@@ -155,12 +153,10 @@ def create_ics_file(events):
     
     for evt in events:
         try:
-            # evt['date'] = "2026-01-12", evt['start'] = "13:30"
             d_clean = evt['date'].replace('-', '')
             s_clean = evt['start'].replace(':', '') + "00"
             e_clean = evt['end'].replace(':', '') + "00"
             
-            # Sécurité 2026
             if d_clean.startswith("2025"): d_clean = d_clean.replace("2025", "2026", 1)
 
             ics.append("BEGIN:VEVENT")
@@ -181,7 +177,6 @@ def main():
     print("Téléchargement PDF...")
     response = requests.get(PDF_URL)
     
-    # 300 DPI pour la précision
     print("Conversion PDF -> Images (300 DPI)...")
     images = convert_from_bytes(response.content, dpi=300) 
 
