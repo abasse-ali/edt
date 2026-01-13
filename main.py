@@ -22,10 +22,12 @@ RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Th
 """
 
 def get_gemini_response(image):
-    # URL directe de l'API (plus fiable que la librairie Python)
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={API_KEY}"
+    # CORRECTION MAJEURE ICI :
+    # 1. On utilise 'gemini-1.5-flash-001' (version stable spécifique) au lieu de l'alias générique
+    # 2. On utilise l'URL directe pour éviter les bugs de librairie Python
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-001:generateContent?key={API_KEY}"
     
-    # 1. Conversion de l'image PIL en Base64
+    # Préparation de l'image
     img_byte_arr = io.BytesIO()
     image.save(img_byte_arr, format='JPEG')
     img_bytes = img_byte_arr.getvalue()
@@ -34,27 +36,26 @@ def get_gemini_response(image):
     current_year = datetime.now().year
 
     prompt_text = f"""
-    Agis comme un assistant de planification. Analyse cette image d'emploi du temps pour l'étudiant du groupe "GB".
+    Agis comme un assistant de planification expert. Analyse cette image d'emploi du temps pour l'étudiant du groupe "GB".
     
     CONTEXTE :
     - Année courante : {current_year}
-    - Rôle : Produire UNIQUEMENT le contenu textuel d'un fichier iCalendar (.ics).
+    - Objectif : Extraire les événements pour un calendrier (.ics).
 
-    RÈGLES VISUELLES :
-    1. Si une journée a deux sous-lignes, IGNORE celle du HAUT et les cases ORANGE.
-    2. Groupe : Garde uniquement les cours "/GB" ou sans groupe. Ignore "/GC".
+    RÈGLES DE LECTURE VISUELLE :
+    1. Si une journée a deux lignes horizontales, IGNORE la ligne du HAUT et les cases ORANGE. Lis UNIQUEMENT la ligne du BAS.
+    2. Groupe : Ignore les cours "/GC". Garde uniquement "/GB" ou les cours sans groupe.
     3. Horaires : Les lignes verticales marquent 15min. Début journée 7h45.
-       Ex: 1er créneau souvent 07h45-09h45. 2ème 10h00-12h00.
+       Ex: 07h45-09h45, 10h00-12h00, 13h30-15h30, 15h45-17h45.
     4. Salles : Petit carré vert en haut à droite.
-    5. Profs : Remplace les initiales selon : {PROFS_DICT}
+    5. Profs : Utilise ce dictionnaire : {PROFS_DICT}
 
-    SORTIE :
-    - Uniquement le texte brut du fichier ICS.
-    - Pas de ```markdown.
+    SORTIE ATTENDUE (Format ICS Brut) :
     - Doit commencer par BEGIN:VCALENDAR et finir par END:VCALENDAR.
+    - Pas de balises markdown (```).
+    - Pour chaque cours: SUMMARY (Matière + Prof), LOCATION (Salle), DTSTART, DTEND.
     """
 
-    # 2. Construction du payload JSON
     payload = {
         "contents": [{
             "parts": [
@@ -69,14 +70,13 @@ def get_gemini_response(image):
         }]
     }
 
-    # 3. Envoi de la requête
     headers = {'Content-Type': 'application/json'}
     response = requests.post(url, headers=headers, data=json.dumps(payload))
 
     if response.status_code != 200:
-        raise Exception(f"Erreur API Gemini ({response.status_code}): {response.text}")
+        # Affiche l'erreur exacte renvoyée par Google pour le débogage
+        raise Exception(f"Erreur API ({response.status_code}): {response.text}")
 
-    # 4. Extraction du texte
     try:
         return response.json()['candidates'][0]['content']['parts'][0]['text']
     except (KeyError, IndexError):
@@ -84,7 +84,7 @@ def get_gemini_response(image):
 
 def main():
     if not API_KEY:
-        raise Exception("La clé API GEMINI_API_KEY est manquante !")
+        raise Exception("Erreur : La clé API GEMINI_API_KEY est introuvable dans les secrets.")
 
     print(f"Téléchargement du PDF...")
     response = requests.get(PDF_URL)
@@ -101,13 +101,11 @@ def main():
         print(f"Envoi page {i+1} à l'API...")
         ics_part = get_gemini_response(img)
         
-        # Nettoyage
+        # Nettoyage de la réponse
         lines = ics_part.splitlines()
         for line in lines:
             line = line.strip()
-            # On retire les balises markdown si l'IA en a mis
             if line.startswith("```"): continue
-            # On ne duplique pas les en-têtes
             if line.startswith("BEGIN:VCALENDAR") or line.startswith("END:VCALENDAR") or line.startswith("VERSION:") or line.startswith("PRODID:"):
                 continue
             if line:
@@ -118,7 +116,7 @@ def main():
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         f.write(full_ics_content)
     
-    print(f"Succès ! Fichier {OUTPUT_FILE} créé.")
+    print(f"Succès ! Fichier {OUTPUT_FILE} généré.")
 
 if __name__ == "__main__":
     main()
