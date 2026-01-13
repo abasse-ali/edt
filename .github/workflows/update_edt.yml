@@ -39,17 +39,13 @@ jobs:
           git config --global user.name 'GitHub Action'
           git config --global user.email 'action@github.com'
           
-          # VÉRIFICATION DE SÉCURITÉ
-          if [ -f edt.ics ]; then
-            git add edt.ics
-            if git diff --staged --quiet; then
-              echo "Pas de changement détecté."
-            else
-              git commit -m "Mise à jour EDT via IA Gemini"
-              git pull --rebase -Xtheirs origin main
-              git push origin main
-            fi
+          # On ajoute le calendrier ET le fichier de debug
+          git add edt.ics debug.txt
+          
+          if git diff --staged --quiet; then
+            echo "Pas de changement."
           else
-            echo "ERREUR: Le fichier edt.ics n'a pas été généré."
-            exit 1
+            git commit -m "Mise à jour EDT + Debug logs"
+            git pull --rebase -Xtheirs origin main
+            git push origin main
           fi
