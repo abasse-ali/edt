@@ -1,6 +1,7 @@
 import os
 import requests
 import json
+import re
 import google.generativeai as genai
 from pdf2image import convert_from_path
 from ics import Calendar, Event
@@ -10,37 +11,43 @@ from pytz import timezone
 # --- CONFIGURATION ---
 PDF_URL = "https://stri.fr/Gestion_STRI/TAV/L3/EDT_STRI1A_L3IRT_TAV.pdf"
 API_KEY = os.environ.get("GEMINI_API_KEY")
-MY_GROUP = "GB" # Ton groupe cible
+MY_GROUP = "GB"
 
-# Configuration de l'IA
+# Configuration IA
 genai.configure(api_key=API_KEY)
 
-# Le "Cerveau" de l'extraction : Les instructions données à l'IA
+# --- LE CERVEAU (Prompt amélioré) ---
 SYSTEM_PROMPT = """
-Tu es un assistant qui convertit des images d'emploi du temps universitaire en données structurées JSON.
+Tu es un assistant expert en extraction de données. Ta mission est de convertir une image d'emploi du temps universitaire en JSON structuré propre.
 
-RÈGLES STRICTES D'EXTRACTION :
-1. ANALYSE VISUELLE : L'image contient une grille. Les colonnes sont les jours, les lignes sont les heures.
-2. GROUPE CIBLE : L'étudiant est dans le groupe "GB".
-   - Si une case horaire est divisée en deux (une ligne en haut, une ligne en bas), le groupe GB est souvent la ligne du BAS.
-   - Si un cours mentionne explicitement "GC" et pas "GB", IGNORE-LE.
-   - Si un cours mentionne "GB" ou est un cours magistral (Amphi) sans groupe, GARDE-LE.
-3. DATES : Identifie la date du Lundi affichée en haut (ex: "12/janv") et déduis l'année (probablement 2026 vu le contexte scolaire). Calcule la date exacte pour chaque jour (Lundi, Mardi, etc.).
-4. HEURES : Regarde attentivement la position verticale pour déterminer l'heure de début et de fin.
-   - Les cours commencent souvent à h00, h15, h30 ou h45.
-5. EXAMENS : Les cases sur fond JAUNE sont des examens. Ajoute "EXAM: " au début du titre.
+CONTEXTE :
+- C'est un emploi du temps "grille" (Colonnes=Jours, Lignes=Heures).
+- L'étudiant appartient au groupe "GB".
+- Il y a beaucoup de "bruit" visuel (superposition de textes).
 
-FORMAT DE SORTIE JSON (Liste d'objets) :
+RÈGLES DE TRI (CRITIQUE) :
+1. **GROUPE** : Si une case est divisée en deux (haut/bas), le groupe "GB" est souvent en BAS. Si un cours est marqué "GC" explicitement, IGNORE-LE. Si c'est "Commun" ou "Amphi", GARDE-LE.
+2. **NETTOYAGE** : 
+   - Ne crée JAMAIS d'événement si le texte n'est qu'un nom de salle (ex: "U3-Amphi", "U3-110", "Salle TP"). C'est du bruit.
+   - Ne crée JAMAIS d'événement pour le texte "Page 1" ou des numéros de bas de page.
+   - Si le texte est éclaté (ex: "Télécoms" sur une ligne, "JGT" sur l'autre), FUSIONNE-LE en un seul titre cohérent : "Télécoms (JGT)".
+3. **EXAMENS** : Les cases jaunes sont des examens. Ajoute "EXAM: " au début du titre.
+
+FORMAT JSON ATTENDU :
+Renvoie une LISTE d'objets JSON. Rien d'autre.
 [
   {
-    "summary": "Nom du cours (ex: Télécoms JGT)",
+    "summary": "Nom du cours nettoyé (ex: Télécoms (JGT))",
     "location": "Salle (ex: U3-Amphi)",
     "start": "YYYY-MM-DD HH:MM",
     "end": "YYYY-MM-DD HH:MM"
   }
 ]
 
-Ne renvoie QUE le JSON brut. Pas de markdown, pas d'explication.
+DATES :
+- Repère la date du Lundi (ex: 12/janv) en haut de l'image.
+- Déduis l'année intelligemment (si on est en janvier/février, c'est l'année civile en cours, ex: 2026).
+- Calcule la date précise pour chaque cours.
 """
 
 def download_pdf():
@@ -49,82 +56,108 @@ def download_pdf():
         r = requests.get(PDF_URL, verify=False, timeout=30)
         with open("edt.pdf", "wb") as f:
             f.write(r.content)
-        print("PDF téléchargé.")
     except Exception as e:
         print(f"Erreur téléchargement: {e}")
         exit(1)
 
-def extract_with_ai():
+def is_garbage(summary):
+    """Filtre de sécurité pour supprimer les déchets que l'IA aurait laissé passer"""
+    s = summary.strip().lower()
+    # Si c'est vide ou très court
+    if len(s) < 3: return True
+    # Si c'est littéralement "Page 1"
+    if "page" in s and len(s) < 10: return True
+    # Si c'est juste un nom de salle (ex: U3-Amphi, U3-203)
+    if re.match(r'^(u\d[-\s\w/]+|amphi|salle \w+)$', s): return True
+    return False
+
+def extract_schedule_ai():
     print("Conversion PDF -> Images...")
     try:
-        # Convertit chaque page du PDF en image
         images = convert_from_path("edt.pdf")
     except Exception as e:
-        print(f"Erreur critique: Impossible de convertir le PDF. Poppler est-il installé ? {e}")
+        print(f"Erreur Poppler: {e}")
         exit(1)
 
-    # Modèle Google Gemini 1.5 Flash (Rapide et Gratuit)
     model = genai.GenerativeModel('gemini-1.5-flash')
-    
     all_events = []
 
     for i, img in enumerate(images):
-        print(f"--- Analyse IA de la page {i+1} ---")
+        print(f"--- Analyse IA Page {i+1} ---")
         try:
-            # On envoie le prompt + l'image à l'IA
+            # Appel API Gemini
             response = model.generate_content([SYSTEM_PROMPT, img])
             text = response.text.strip()
             
-            # Nettoyage du Markdown json (```json ... ```)
+            # Nettoyage Markdown
             if text.startswith("```"):
                 text = text.split("\n", 1)[1]
                 if text.endswith("```"):
                     text = text.rsplit("\n", 1)[0]
             
-            # Parsing JSON
             data = json.loads(text)
-            print(f"   -> {len(data)} cours trouvés.")
-            all_events.extend(data)
+            
+            # Filtrage post-IA
+            valid_count = 0
+            for item in data:
+                if not is_garbage(item.get('summary', '')):
+                    all_events.append(item)
+                    valid_count += 1
+            
+            print(f"   -> {valid_count} cours valides extraits.")
             
         except Exception as e:
-            print(f"Erreur IA sur la page {i+1}: {e}")
-            # print(response.text) # Décommenter pour debug
+            print(f"Erreur sur la page {i+1}: {e}")
 
     return all_events
 
-def generate_ics(events_data):
+def create_ics(events_data):
     cal = Calendar()
     tz = timezone('Europe/Paris')
     
+    # Dictionnaire pour Mapping Profs (Nettoyage final)
+    PROFS = {
+        "JGT": "Jean-Guy TARTARIN", "AA": "André AOUN", "PT": "Patrice TORGUET",
+        "MM": "Mustapha MOJAHID", "AnAn": "Andréi ANDRÉI", "OM": "Olfa MECHI",
+        "BA": "Ben A.", "JS": "Jérôme SOKOLOFF"
+    }
+
     for item in events_data:
         try:
+            summary = item.get('summary', 'Cours')
+            
+            # Dernier nettoyage des sigles profs
+            for sigle, nom in PROFS.items():
+                if f"({sigle})" in summary or f" {sigle} " in summary:
+                    summary = summary.replace(sigle, nom).replace("((", "(").replace("))", ")")
+
             e = Event()
-            e.name = item.get('summary', 'Cours Inconnu')
+            e.name = summary
             e.location = item.get('location', '')
             
-            # Conversion string -> datetime avec fuseau horaire
-            start_dt = datetime.strptime(item['start'], "%Y-%m-%d %H:%M")
-            end_dt = datetime.strptime(item['end'], "%Y-%m-%d %H:%M")
+            # Dates
+            dt_start = datetime.strptime(item['start'], "%Y-%m-%d %H:%M")
+            dt_end = datetime.strptime(item['end'], "%Y-%m-%d %H:%M")
             
-            e.begin = tz.localize(start_dt)
-            e.end = tz.localize(end_dt)
+            e.begin = tz.localize(dt_start)
+            e.end = tz.localize(dt_end)
             
             cal.events.add(e)
         except Exception as e:
-            print(f"Erreur création événement {item}: {e}")
+            print(f"Event ignoré (données invalides): {item} - {e}")
 
     with open("edt.ics", "w") as f:
         f.write(cal.serialize())
-    print("Calendrier edt.ics généré avec succès !")
+    print("Fichier ICS généré avec succès.")
 
 if __name__ == "__main__":
     if not API_KEY:
-        print("ERREUR: La clé API GEMINI_API_KEY est manquante.")
+        print("ERREUR: Pas de clé API !")
         exit(1)
-        
+    
     download_pdf()
-    events = extract_with_ai()
-    if events:
-        generate_ics(events)
+    data = extract_schedule_ai()
+    if data:
+        create_ics(data)
     else:
-        print("Aucun cours extrait.")
+        print("Aucun cours trouvé.")
