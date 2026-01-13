@@ -1,2 +1,3 @@
 requests
 pdf2image
+numpy
