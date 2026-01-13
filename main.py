@@ -5,7 +5,9 @@ import base64
 import requests
 import re
 import time
+import numpy as np
 from pdf2image import convert_from_bytes
+from PIL import Image, ImageDraw, ImageFont
 
 # --- CONFIGURATION ---
 PDF_URL = "https://stri.fr/Gestion_STRI/TAV/L3/EDT_STRI1A_L3IRT_TAV.pdf"
@@ -21,15 +23,6 @@ OM=Olfa MECHI; PA=Patrick AUSTIN; PhA=Philippe ARGUEL; PIL=Pierre LOTTE; PL=Phil
 RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Thierry DESPRATS; TG=Thierry GAYRAUD.
 """
 
-def get_available_models():
-    """Récupère la liste réelle des modèles activés pour votre clé."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
-    try:
-        response = requests.get(url)
-        if response.status_code != 200: return []
-        return [m['name'].replace('models/', '') for m in response.json().get('models', [])]
-    except: return []
-
 def clean_json_text(text):
     text = re.sub(r"```json|```", "", text).strip()
     start = text.find('[')
@@ -37,6 +30,46 @@ def clean_json_text(text):
     if start != -1 and end != -1:
         return text[start:end+1]
     return text
+
+def preprocess_image(pil_image):
+    """
+    Traite l'image pour effacer l'Orange et accentuer le Jaune.
+    Couleurs Cibles :
+    - Orange (Ignore) : #FFB84D -> RGB(255, 184, 77)
+    - Jaune (Examen)  : #FFD966 -> RGB(255, 217, 102)
+    - Vert (Salle)    : #8BC34A -> RGB(139, 195, 74)
+    """
+    print("   🎨 Prétraitement des couleurs (Gommage Orange / Marquage Jaune)...")
+    
+    # Conversion en tableau NumPy pour vitesse
+    img_array = np.array(pil_image)
+    
+    # Définition des couleurs et tolérances (car la conversion PDF->Img altère légèrement les couleurs)
+    # On utilise une tolérance de +/- 20 sur chaque canal RGB
+    
+    # ORANGE : [255, 184, 77]
+    orange_lower = np.array([235, 164, 57])
+    orange_upper = np.array([255, 204, 97])
+    
+    # JAUNE : [255, 217, 102]
+    yellow_lower = np.array([235, 197, 82])
+    yellow_upper = np.array([255, 237, 122])
+
+    # Création des masques
+    # Masque Orange : (R >= low & R <= high) & (G >= low ...)
+    mask_orange = np.all((img_array >= orange_lower) & (img_array <= orange_upper), axis=-1)
+    
+    # EFFACEMENT ORANGE : On remplace par du Blanc [255, 255, 255]
+    img_array[mask_orange] = [255, 255, 255]
+
+    # Reconversion en image PIL pour ajouter du texte sur le jaune
+    clean_image = Image.fromarray(img_array)
+    draw = ImageDraw.Draw(clean_image)
+    
+    # Pour le jaune, on ne l'efface pas, mais on peut aider l'IA en détectant les zones
+    # (Optionnel : si le jaune est trop pâle, on pourrait le foncer, mais ici on compte sur le prompt)
+    
+    return clean_image
 
 def call_gemini_api(image, model_name):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={API_KEY}"
@@ -46,44 +79,37 @@ def call_gemini_api(image, model_name):
     b64_data = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
 
     prompt = f"""
-    Tu es un expert en lecture d'emploi du temps complexe.
-    TACHE : Extraire les cours pour le groupe "GB".
+    Tu es un expert en lecture d'emploi du temps.
+    TACHE : Extraire les cours du groupe "GB".
     ANNÉE : 2026.
 
-    RÈGLES DE LECTURE GÉOMÉTRIQUE (CRITIQUE) :
-    1. **LECTURE LIGNE PAR LIGNE** : 
-       - Repère le jour à gauche (ex: "Lundi").
-       - Lis UNIQUEMENT les cases alignées horizontalement avec ce jour.
-       - NE SAUTE PAS de lignes, ne mélange pas les jours.
+    CONTEXTE VISUEL :
+    J'ai pré-traité l'image pour toi :
+    1. Les cours ANNULÉS/ADMIN (Fond Orange) ont été EFFACÉS (blancs). Ignore les trous blancs.
+    2. Les cours EXAMENS sont sur fond JAUNE.
 
-    2. **SOUS-LIGNES (HAUT/BAS)** :
-       - Sur une même journée, il y a souvent deux lignes de cours superposées.
-       - Ligne du HAUT = Groupe GA/G1 -> **IGNORER**.
-       - Ligne du BAS = Groupe GB -> **C'EST TA CIBLE (GARDER)**.
-       - Si une seule ligne centrée -> Garder (Cours commun).
-
-    3. **COULEURS (ATTENTION)** :
-       - Case **JAUNE** = **EXAMEN** -> GARDER IMPÉRATIVEMENT (Ajoute "[EXAMEN]" dans le titre).
-       - Case **ORANGE** = INFO ADMIN/ANNULÉ -> **IGNORER/JETER**.
-       - Case BLANCHE = COURS NORMAL -> GARDER.
-
+    RÈGLES DE LECTURE :
+    1. **LECTURE LIGNE PAR LIGNE** : Repère le jour à gauche. Lis tous les cours de cette ligne.
+    2. **GROUPES (HAUT/BAS)** :
+       - Si une case est divisée horizontalement :
+         - HAUT = GA -> IGNORE.
+         - BAS = GB -> LIS CE COURS.
+       - Si texte centré = Cours commun -> LIS.
+    3. **FILTRES** :
+       - Garde "/GB" ou sans groupe.
+       - Si tu vois un fond JAUNE, ajoute "[EXAMEN]" au début du titre.
+    
     4. **HORAIRES** :
-       - Col 1 : 07h45 - 09h45
-       - Col 2 : 10h00 - 12h00
-       - Col 3 : **13h30** - 15h30 (Commence à la 2ème graduation après 13h)
-       - Col 4 : 15h45 - 17h45
+       - Col 1 : 07h45-09h45
+       - Col 2 : 10h00-12h00
+       - Col 3 : 13h30-15h30 (Attention : commence à la 2ème graduation après 13h)
+       - Col 4 : 15h45-17h45
 
-    FORMAT DE SORTIE (JSON LIST) :
+    FORMAT JSON LIST :
     [
-      {{
-        "date": "2026-MM-JJ",
-        "summary": "Matière (Prof)",
-        "start": "HH:MM",
-        "end": "HH:MM",
-        "location": "Salle"
-      }}
+      {{ "date": "2026-MM-JJ", "summary": "Matière (Prof)", "start": "HH:MM", "end": "HH:MM", "location": "Salle" }}
     ]
-    Utilise ce dictionnaire pour les profs : {PROFS_DICT}
+    Profs: {PROFS_DICT}
     """
 
     payload = {
@@ -100,76 +126,28 @@ def call_gemini_api(image, model_name):
     return requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
 
 def get_schedule_robust(image):
-    # 1. On récupère les modèles dispos pour votre clé
-    available_in_account = get_available_models()
+    # On prétraite l'image pour gérer les couleurs
+    cleaned_img = preprocess_image(image)
     
-    # 2. LISTE MASSIVE DE PRIORITÉ (Ordre : Intelligence > Vitesse)
-    # On met tout ce qui peut lire une image.
-    priority_list = [
-        # -- TIER 1 : Les cerveaux (Pro) --
-        "gemini-2.5-pro",
-        "gemini-3-pro-preview",
-        "gemini-1.5-pro",
-        "gemini-1.5-pro-latest",
-        "gemini-exp-1206",
-        
-        # -- TIER 2 : Les rapides équilibrés (Flash) --
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-2.0-flash-001",
-        "gemini-flash-latest",     # Souvent le plus fiable en quota
-        "gemini-1.5-flash",
-        
-        # -- TIER 3 : Les légers (Lite) --
-        "gemini-2.0-flash-lite-preview-02-05",
-        "gemini-2.0-flash-lite",
-        "gemini-2.5-flash-lite",
-        
-        # -- TIER 4 : Les expérimentaux --
-        "gemini-pro-latest",
-        "gemini-2.0-flash-exp"
-    ]
-
-    # On ne garde que ceux qui existent vraiment pour vous
-    models_to_try = [m for m in priority_list if m in available_in_account]
+    # Liste de modèles avec Failover
+    models = ["gemini-1.5-pro", "gemini-1.5-pro-latest", "gemini-2.0-flash", "gemini-flash-latest"]
     
-    # Sécurité si la liste est vide (bug API)
-    if not models_to_try:
-        models_to_try = ["gemini-flash-latest", "gemini-1.5-flash"]
-
-    print(f"   📋 {len(models_to_try)} modèles prêts à être testés.")
-
-    # BOUCLE DE SURVIE
-    for model in models_to_try:
-        print(f"   👉 Tentative avec : {model}...")
+    for model in models:
+        print(f"   👉 Lecture avec : {model}...")
         try:
-            response = call_gemini_api(image, model)
-
-            # SUCCÈS
+            response = call_gemini_api(cleaned_img, model)
             if response.status_code == 200:
-                raw_resp = response.json()
-                if 'candidates' in raw_resp and raw_resp['candidates']:
-                    clean = clean_json_text(raw_resp['candidates'][0]['content']['parts'][0]['text'])
+                raw = response.json()
+                if 'candidates' in raw and raw['candidates']:
+                    clean = clean_json_text(raw['candidates'][0]['content']['parts'][0]['text'])
                     return json.loads(clean)
-                else:
-                    print("      ⚠️ Réponse vide (IA muette). Suivant...")
-                    continue
-            
-            # ECHECS TEMPORAIRES (On passe direct au suivant sans attendre)
             elif response.status_code in [429, 503]:
-                print(f"      ⚠️ Bloqué ({response.status_code}). Suivant immédiat...")
+                print(f"      ⚠️ Surcharge ({response.status_code}). Suivant...")
                 continue
-
-            # AUTRES ERREURS
-            else:
-                print(f"      ❌ Erreur {response.status_code}. Suivant...")
-                continue
-
         except Exception as e:
-            print(f"      ❌ Exception technique : {e}. Suivant...")
+            print(f"      ❌ Erreur : {e}")
             continue
-
-    print("❌ ECHEC TOTAL : Tous les modèles ont échoué.")
+            
     return []
 
 def create_ics_file(events):
@@ -182,25 +160,24 @@ def create_ics_file(events):
     ]
     for evt in events:
         try:
-            d_clean = evt['date'].replace('-', '')
-            s_clean = evt['start'].replace(':', '') + "00"
-            e_clean = evt['end'].replace(':', '') + "00"
-            if d_clean.startswith("2025"): d_clean = d_clean.replace("2025", "2026", 1)
-
-            # Gestion EXAMEN
+            d = evt['date'].replace('-', '')
+            if d.startswith("2025"): d = d.replace("2025", "2026", 1)
+            s = evt['start'].replace(':', '') + "00"
+            e = evt['end'].replace(':', '') + "00"
+            
             summary = evt.get('summary', 'Cours')
+            priority = "5"
+            # Détection Examen renforcée
             if "EXAMEN" in summary.upper():
-                summary = "🔴 [EXAMEN] " + summary
-                priority = "PRIORITY:1"
-            else:
-                priority = "PRIORITY:5"
+                summary = "🔴 " + summary
+                priority = "1"
 
             ics.append("BEGIN:VEVENT")
-            ics.append(f"DTSTART:{d_clean}T{s_clean}")
-            ics.append(f"DTEND:{d_clean}T{e_clean}")
+            ics.append(f"DTSTART:{d}T{s}")
+            ics.append(f"DTEND:{d}T{e}")
             ics.append(f"SUMMARY:{summary}")
             ics.append(f"LOCATION:{evt.get('location', '')}")
-            ics.append(priority)
+            ics.append(f"PRIORITY:{priority}")
             ics.append("DESCRIPTION:Groupe GB")
             ics.append("END:VEVENT")
         except: continue
@@ -213,6 +190,7 @@ def main():
     print("Téléchargement PDF...")
     response = requests.get(PDF_URL)
     
+    # 300 DPI obligatoire pour le filtrage couleur
     print("Conversion PDF -> Images (300 DPI)...")
     images = convert_from_bytes(response.content, dpi=300) 
 
@@ -220,10 +198,10 @@ def main():
     print(f"Traitement de {len(images)} pages...")
     for i, img in enumerate(images):
         print(f"--- Analyse Page {i+1} ---")
-        page_events = get_schedule_robust(img)
-        if page_events:
-            print(f"✅ {len(page_events)} cours trouvés.")
-            all_events.extend(page_events)
+        events = get_schedule_robust(img)
+        if events:
+            print(f"✅ {len(events)} cours trouvés.")
+            all_events.extend(events)
         else:
             print("❌ Echec lecture page.")
 
