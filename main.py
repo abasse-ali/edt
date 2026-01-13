@@ -7,7 +7,7 @@ import re
 import time
 import numpy as np
 from pdf2image import convert_from_bytes
-from PIL import Image, ImageDraw
+from PIL import Image
 
 # --- CONFIGURATION ---
 PDF_URL = "https://stri.fr/Gestion_STRI/TAV/L3/EDT_STRI1A_L3IRT_TAV.pdf"
@@ -24,7 +24,7 @@ RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Th
 """
 
 def get_available_models():
-    """Récupère les modèles disponibles pour la clé."""
+    """Récupère les modèles dispos pour votre clé."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
     try:
         response = requests.get(url)
@@ -42,26 +42,25 @@ def clean_json_text(text):
 
 def preprocess_image_colors(pil_image):
     """
-    Traite les couleurs spécifiques de l'EDT.
-    Orange (#FFB84D) -> Blanc (Effacer)
-    Jaune (#FFD966) -> Garder (Examen)
+    Efface le Orange (Sport/Annulé) mais GARDE le Jaune (Examen).
+    Orange (#FFB84D) ~ RGB(255, 184, 77)
+    Jaune (#FFD966) ~ RGB(255, 217, 102)
+    Différence clé : Le canal VERT (G).
     """
-    print("   🎨 Traitement colorimétrique précis...")
+    print("   🎨 Nettoyage couleurs (Suppression Orange, Conservation Jaune)...")
     img_array = np.array(pil_image)
     
-    # ORANGE (#FFB84D) : R=255, G=184, B=77
-    # JAUNE  (#FFD966) : R=255, G=217, B=102
-    # La différence principale est le VERT (G). Orange < 200, Jaune > 200.
+    # Condition ORANGE (Sport)
+    # Rouge fort (>200)
+    # Vert MOYEN (>130 et <205) -> C'est ici qu'on distingue du jaune (qui est >210)
+    # Bleu faible (<150)
+    red_cond = img_array[:, :, 0] > 200
+    green_cond = (img_array[:, :, 1] > 130) & (img_array[:, :, 1] < 205)
+    blue_cond = img_array[:, :, 2] < 150
     
-    # Condition ORANGE (Sport, etc.)
-    # R > 200 (Rouge fort)
-    # 130 < G < 200 (Vert moyen - c'est la clé pour distinguer de jaune)
-    # B < 150 (Bleu faible)
-    mask_orange = (img_array[:, :, 0] > 200) & \
-                  (img_array[:, :, 1] > 130) & (img_array[:, :, 1] < 200) & \
-                  (img_array[:, :, 2] < 150)
+    mask_orange = red_cond & green_cond & blue_cond
     
-    # On efface l'orange (devient blanc)
+    # On remplace l'orange par du blanc
     img_array[mask_orange] = [255, 255, 255]
     
     return Image.fromarray(img_array)
@@ -74,45 +73,42 @@ def call_gemini_api(image, model_name):
     b64_data = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
 
     prompt = f"""
-    Tu es un expert en lecture d'emploi du temps.
-    TACHE : Analyse cette image pour l'étudiant du **Groupe GB**.
+    Analyse cette page d'emploi du temps universitaire pour le GROUPE "GB" (Groupe B).
     ANNÉE : 2026.
 
-    ⚠️ RÈGLES DE LECTURE GÉOMÉTRIQUE ET STRUCTURELLE (TRES IMPORTANT) :
+    ⚠️ RÈGLES VISUELLES CRITIQUES (Ligne par ligne) :
+    
+    1. **LECTURE VERTICALE (HAUT vs BAS)** : 
+       Dans une même case horaire, il y a souvent DEUX textes superposés séparés par une ligne ou un espace.
+       - TEXTE DU HAUT = Groupe A (GA/GC) -> **IGNORE-LE**.
+       - TEXTE DU BAS = Groupe B (GB) -> **GARDE-LE**.
+       - Si le texte est unique/centré -> GARDE-LE.
 
-    1. **ANCRAGE PAR JOUR** : 
-       - Cherche le mot "Lundi" à gauche. Tout ce qui est sur cette ligne horizontale est pour Lundi.
-       - Cherche "Mardi". Tout ce qui est sur cette ligne est pour Mardi.
-       - Et ainsi de suite. Ne mélange pas les lignes !
+    2. **COULEUR** :
+       - Les cours sur fond ORANGE ont été effacés (blancs).
+       - Les cours sur fond JAUNE sont des EXAMENS -> Ajoute "[EXAMEN]" au début du titre.
 
-    2. **GESTION DES SOUS-LIGNES (HAUT/BAS)** :
-       - Dans une case horaire, il y a souvent DEUX matières l'une au-dessus de l'autre.
-       - CELLE DU HAUT = Groupe 1 (G1/GA) -> **TU DOIS L'IGNORER**.
-       - CELLE DU BAS = Groupe 2 (GB) -> **C'EST CELLE-LA QUE TU DOIS GARDER**.
-       - Si le texte est centré verticalement (pas de division), c'est un cours commun -> GARDER.
+    3. **STRUCTURE** :
+       - Ligne 1 = Lundi, Ligne 2 = Mardi, etc. Repère les jours à gauche.
+       - Colonnes :
+         - 07h45 - 09h45
+         - 10h00 - 12h00
+         - 13h30 - 15h30 (Attention, commence après la pause de midi)
+         - 15h45 - 17h45
 
-    3. **COULEURS** :
-       - Les cases ORANGES (ex: Sport) ont été effacées (sont blanches maintenant). Ignore les vides.
-       - Les cases JAUNES sont des EXAMENS -> Ajoute "[EXAMEN]" au début du nom.
-
-    4. **HORAIRES** :
-       - Colonne 1 : 07h45 - 09h45
-       - Colonne 2 : 10h00 - 12h00
-       - Colonne 3 : **13h30** - 15h30 (Attention, commence à la 2ème graduation après 13h)
-       - Colonne 4 : 15h45 - 17h45
-
-    FORMAT DE SORTIE JSON ATTENDU :
+    FORMAT DE SORTIE JSON :
     [
       {{
-        "day_name": "Lundi/Mardi/...",
+        "day": "Lundi/Mardi/Mercredi/Jeudi/Vendredi",
         "summary": "Matière (Prof)",
         "start": "HH:MM",
         "end": "HH:MM",
         "location": "Salle",
-        "group_position": "BAS/UNIQUE/HAUT"
+        "raw_content_position": "BAS" (ou "UNIQUE", ou "HAUT" si erreur)
       }}
     ]
-    (Remplace les profs avec : {PROFS_DICT})
+    Si une case contient "Anglais" en haut et "Espagnol" en bas, renvoie uniquement "Espagnol".
+    Profs: {PROFS_DICT}
     """
 
     payload = {
@@ -129,102 +125,90 @@ def call_gemini_api(image, model_name):
     return requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
 
 def get_schedule_robust(image):
-    available = get_available_models()
-    
-    # On privilégie GEMINI 1.5 PRO pour sa capacité à lire les tableaux complexes sans "halluciner" les lignes
+    # --- VOTRE LISTE DE PRIORITÉ EXACTE ---
     priority_list = [
-        "gemini-1.5-pro",
+        # --- GÉNÉRATION 3 ---
+        "gemini-3-pro-preview",
+        "gemini-3-flash-preview",
+        # --- GÉNÉRATION 2.5 ---
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        # --- GÉNÉRATION 2.0 ---
+        "gemini-2.0-flash-001",
+        # --- LITE ---
+        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash-lite-preview-02-05",
+        # --- GÉNÉRATION 1.5 ---
         "gemini-1.5-pro-latest",
-        "gemini-1.5-pro-001",
-        "gemini-2.0-flash", # Bon backup
-        "gemini-flash-latest"
+        "gemini-1.5-pro",
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-8b"
     ]
-    
+
+    available = get_available_models()
+    # On filtre pour ne garder que ceux qui existent vraiment sur votre compte
     models_to_try = [m for m in priority_list if m in available]
-    if not models_to_try: models_to_try = ["gemini-1.5-flash"] # Fallback ultime
+    
+    # Fallback si liste vide
+    if not models_to_try: 
+        print("⚠️ Aucun modèle de la liste n'est dispo. Utilisation de gemini-1.5-flash.")
+        models_to_try = ["gemini-1.5-flash"]
 
-    cleaned_img = preprocess_image_colors(image)
+    print(f"   📋 Ordre de test : {models_to_try}")
+    
+    # 1. Nettoyage couleur
+    clean_img = preprocess_image_colors(image)
 
+    # 2. Boucle de tentative
     for model in models_to_try:
-        print(f"   👉 Tentative avec : {model}...")
         try:
-            response = call_gemini_api(cleaned_img, model)
+            print(f"   👉 Tentative avec {model}...")
+            response = call_gemini_api(clean_img, model)
             
             if response.status_code == 200:
-                raw_resp = response.json()
-                if 'candidates' in raw_resp and raw_resp['candidates']:
-                    clean = clean_json_text(raw_resp['candidates'][0]['content']['parts'][0]['text'])
-                    return json.loads(clean)
+                raw = response.json()
+                if 'candidates' in raw and raw['candidates']:
+                    clean_txt = clean_json_text(raw['candidates'][0]['content']['parts'][0]['text'])
+                    return json.loads(clean_txt)
+                else:
+                    print("      ⚠️ Réponse vide.")
+                    continue
             
             elif response.status_code in [429, 503]:
-                print(f"      ⚠️ Bloqué ({response.status_code}). Suivant...")
-                continue
+                print(f"      ⚠️ Erreur {response.status_code} (Quota/Surcharge). Passage au suivant...")
+                continue # On passe au suivant IMMÉDIATEMENT
             
+            else:
+                print(f"      ❌ Erreur {response.status_code}. Suivant...")
+                continue
+                
         except Exception as e:
-            print(f"      ❌ Erreur : {e}")
+            print(f"      ❌ Exception: {e}. Suivant...")
             continue
             
-    print("❌ Tous les modèles ont échoué sur cette page.")
+    print("❌ ECHEC TOTAL : Aucun modèle n'a réussi à lire cette page.")
     return []
 
-def calculate_date(base_date, day_name):
-    # Mapping simple pour la semaine du 12 Janvier 2026 (Semaine 1)
-    # Pour un script de prod, il faudrait lire la date sur l'image ("12/janv")
-    days_map = {"Lundi": 0, "Mardi": 1, "Mercredi": 2, "Jeudi": 3, "Vendredi": 4}
-    
+def calculate_real_date(week_start_str, day_name):
+    """Calcule la date réelle à partir du jour de la semaine."""
+    days = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"]
     # Nettoyage du nom du jour (ex: "Lundi 12")
-    day_key = None
-    for d in days_map:
-        if d in day_name:
-            day_key = d
+    found_day = None
+    for d in days:
+        if d.lower() in day_name.lower():
+            found_day = d
             break
-            
-    if day_key is None: return None
     
+    if not found_day: return None
+
     from datetime import datetime, timedelta
-    start = datetime.strptime(base_date, "%Y-%m-%d")
-    target = start + timedelta(days=days_map[day_key])
-    return target.strftime("%Y-%m-%d")
-
-def filter_and_format_events(raw_events, week_start_date):
-    formatted = []
-    print(f"   🧹 Filtrage Logique (Haut/Bas et Sport)...")
-    
-    for evt in raw_events:
-        summary = evt.get('summary', '').strip()
-        pos = evt.get('group_position', 'UNIQUE').upper()
-        
-        # 1. Filtre SPORT (si le nettoyage couleur a raté)
-        if "SPORT" in summary.upper() and "EXAMEN" not in summary.upper():
-            print(f"      🗑️ Rejet (Sport) : {summary}")
-            continue
-            
-        # 2. Filtre Position HAUT (Sauf si GB mentionné explicitement)
-        if pos == "HAUT" and "GB" not in summary.upper():
-            print(f"      🗑️ Rejet (Groupe Haut/GA) : {summary}")
-            continue
-            
-        # 3. Filtre Groupe Explicite GA/GC
-        if "/GA" in summary.upper() or "/GC" in summary.upper() or "(GA)" in summary.upper():
-            print(f"      🗑️ Rejet (Tag GA/GC) : {summary}")
-            continue
-
-        # Calcul date
-        real_date = calculate_date(week_start_date, evt.get('day_name', 'Lundi'))
-        if not real_date: continue
-        
-        evt['real_date'] = real_date
-        
-        # Nettoyage titre
-        if "EXAMEN" in summary.upper() and not summary.startswith("🔴"):
-             evt['summary'] = "🔴 " + summary
-             evt['priority'] = "1"
-        else:
-             evt['priority'] = "5"
-             
-        formatted.append(evt)
-        
-    return formatted
+    try:
+        start_date = datetime.strptime(week_start_str, "%Y-%m-%d")
+        delta = days.index(found_day)
+        target_date = start_date + timedelta(days=delta)
+        return target_date.strftime("%Y-%m-%d")
+    except: return None
 
 def create_ics_file(events):
     ics = [
@@ -236,16 +220,41 @@ def create_ics_file(events):
     ]
     for evt in events:
         try:
+            # FILTRAGE FINAL DE SÉCURITÉ
+            summary = evt.get('summary', '').upper()
+            
+            # 1. Si "GA" ou "GC" est explicitement écrit -> Poubelle
+            if "/GA" in summary or "/GC" in summary: 
+                print(f"      🗑️ Rejet (Tag GA/GC): {summary}")
+                continue
+                
+            # 2. Si position "HAUT" détectée par l'IA -> Poubelle (sauf si GB mentionné)
+            if evt.get('raw_content_position') == "HAUT" and "GB" not in summary:
+                 print(f"      🗑️ Rejet (Position Haut): {summary}")
+                 continue
+
+            # 3. Si Sport est encore là (couleur ratée) -> Poubelle (sauf si examen)
+            if "SPORT" in summary and "EXAMEN" not in summary:
+                print(f"      🗑️ Rejet (Sport): {summary}")
+                continue
+
             d = evt['real_date'].replace('-', '')
             s = evt['start'].replace(':', '') + "00"
             e = evt['end'].replace(':', '') + "00"
             
+            final_summary = evt.get('summary', 'Cours')
+            priority = "5"
+            
+            if "EXAMEN" in final_summary.upper():
+                if "🔴" not in final_summary: final_summary = "🔴 " + final_summary
+                priority = "1"
+
             ics.append("BEGIN:VEVENT")
             ics.append(f"DTSTART:{d}T{s}")
             ics.append(f"DTEND:{d}T{e}")
-            ics.append(f"SUMMARY:{evt['summary']}")
+            ics.append(f"SUMMARY:{final_summary}")
             ics.append(f"LOCATION:{evt.get('location', '')}")
-            ics.append(f"PRIORITY:{evt['priority']}")
+            ics.append(f"PRIORITY:{priority}")
             ics.append("DESCRIPTION:Groupe GB")
             ics.append("END:VEVENT")
         except: continue
@@ -263,25 +272,27 @@ def main():
 
     all_events = []
     
-    # Dates de début de semaine (Supposées pour l'exemple, à adapter)
-    # Page 1 = Semaine du 12 Janvier 2026
-    # Page 2 = Semaine du 19 Janvier 2026...
+    # DATES DE DÉBUT DE SEMAINE (Fixées pour l'exemple 2026)
+    # Page 1 = Semaine du 12 Janvier
     start_dates = ["2026-01-12", "2026-01-19", "2026-01-26", "2026-02-02", "2026-02-09"]
 
     print(f"Traitement de {len(images)} pages...")
     for i, img in enumerate(images):
         print(f"--- Page {i+1} ---")
         
-        # Récupération brute
-        raw_data = get_schedule_robust(img)
+        # Appel API Robuste
+        page_events = get_schedule_robust(img)
         
-        # Filtrage et Calcul de date
-        week_date = start_dates[i] if i < len(start_dates) else "2026-01-01"
-        valid_events = filter_and_format_events(raw_data, week_date)
+        # Attribution des dates réelles
+        week_start = start_dates[i] if i < len(start_dates) else "2026-01-01"
         
-        all_events.extend(valid_events)
+        for evt in page_events:
+            real_date = calculate_real_date(week_start, evt.get('day', ''))
+            if real_date:
+                evt['real_date'] = real_date
+                all_events.append(evt)
         
-        # Pause anti-quota
+        print(f"   ✅ {len(page_events)} cours bruts récupérés.")
         time.sleep(2)
 
     print("Génération ICS...")
