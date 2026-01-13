@@ -3,13 +3,13 @@ name: Mise à jour EDT
 on:
   schedule:
     - cron: '0 4 * * *' # Tous les jours à 04h00 UTC
-  workflow_dispatch: # Permet de lancer manuellement pour tester
+  workflow_dispatch:
 
 jobs:
   update-calendar:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # Nécessaire pour sauvegarder le fichier sur le repo
+      contents: write
 
     steps:
       - name: Récupérer le code
@@ -21,8 +21,9 @@ jobs:
           python-version: '3.10'
 
       - name: Installer dépendances
+        # CHANGEMENT ICI : on utilise la nouvelle lib google-genai
         run: |
-          pip install requests google-generativeai
+          pip install requests google-genai
 
       - name: Lancer le script d'extraction
         env:
@@ -34,5 +35,4 @@ jobs:
           git config --global user.name "GitHub Action"
           git config --global user.email "action@github.com"
           git add emploi_du_temps.ics
-          # Ne commit que si le fichier a changé
           git diff --quiet && git diff --staged --quiet || (git commit -m "Mise à jour EDT $(date +'%Y-%m-%d')" && git push)
