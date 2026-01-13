@@ -1,0 +1,43 @@
+name: Mise à jour Emploi du Temps
+
+on:
+  schedule:
+    # S'exécute tous les jours à 4h00 UTC
+    - cron: '0 4 * * *'
+  workflow_dispatch: # Permet de lancer manuellement depuis l'interface GitHub
+
+permissions:
+  contents: write
+
+jobs:
+  update-calendar:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Python Dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Extraction Script
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python main.py
+
+      - name: Commit and Push changes
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Mise à jour auto de l'EDT via Gemini"
+          file_pattern: "emploi_du_temps.ics"
