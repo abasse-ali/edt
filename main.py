@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 PDF_URL = "https://stri.fr/Gestion_STRI/TAV/L3/EDT_STRI1A_L3IRT_TAV.pdf"
 OUTPUT_FILE = "emploi_du_temps.ics"
 API_KEY = os.environ.get("GEMINI_API_KEY")
-CONSENSUS_RETRIES = 3 # Nombre de reloads par page (3 est recommandé pour la majorité)
+CONSENSUS_RETRIES = 3 # Nombre de reloads par page
 
 PROFS_DICT = """
 AnAn=Andréi ANDRÉI; AA=André AOUN; AB=Abdelmalek BENZEKRI; AL=Abir LARABA; BC=Bilal CHEBARO; 
@@ -81,6 +81,7 @@ def extract_schedule_with_geometry(image, model_list):
     Profs: {PROFS_DICT}
     """
     for model in model_list:
+        print(f"         👉 Tentative avec {model}...")
         try:
             resp = call_gemini(image, model, prompt)
             if resp.status_code == 200:
@@ -212,30 +213,26 @@ def analyze_page_consensus(image, models):
         all_runs.append(events)
     
     # Système de vote
-    # Clé unique = (Date, Heure, Matière)
     vote_counts = {}
     event_objects = {}
     
     for run in all_runs:
         seen_in_run = set()
         for evt in run:
-            # Clé normalisée pour comparaison
             key = (evt['real_date'], evt['start'], evt['end'], evt['summary'].strip())
             if key in seen_in_run: continue
             seen_in_run.add(key)
-            
             vote_counts[key] = vote_counts.get(key, 0) + 1
             if key not in event_objects: event_objects[key] = evt
             
-    # Filtrage par majorité
     final_list = []
-    threshold = (CONSENSUS_RETRIES // 2) + 1 # Majorité absolue (2/3)
+    threshold = (CONSENSUS_RETRIES // 2) + 1 
     
     for key, count in vote_counts.items():
         if count >= threshold:
             final_list.append(event_objects[key])
         else:
-            print(f"      🗑️ Rejet Consensus (Vu seulement {count}/{CONSENSUS_RETRIES} fois): {key[3]}")
+            print(f"      🗑️ Rejet Consensus (Vu {count}/{CONSENSUS_RETRIES} fois): {key[3]}")
             
     return final_list
 
