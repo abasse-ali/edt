@@ -1,4 +1,5 @@
 requests
-pdfplumber
+google-generativeai
+pdf2image
 ics
 pytz
