@@ -46,7 +46,7 @@ def preprocess_destructive(pil_image):
     """
     img_array = np.array(pil_image)
     
-    # ORANGE (#FFB84D) : R>180, 100<G<210, B<160
+    # ORANGE (#FFB84D)
     red_cond = img_array[:, :, 0] > 180
     green_cond = (img_array[:, :, 1] > 100) & (img_array[:, :, 1] < 210)
     blue_cond = img_array[:, :, 2] < 160
@@ -77,19 +77,26 @@ def call_gemini(image, model_name, prompt):
 
 def extract_schedule_with_geometry(image, model_list):
     """
-    Extrait cours + coordonnées pour savoir où ils sont (Haut/Bas/Gauche/Droite).
+    Extraction avec géométrie et règles horaires strictes.
     """
     prompt = f"""
-    Analyse cette image d'emploi du temps. ANNÉE : 2026.
+    Analyse cette image d'emploi du temps (multi-semaines).
+    ANNÉE : 2026.
 
-    OBJECTIF : Lister TOUS les éléments (Dates, Cours) avec leurs COORDONNÉES.
+    OBJECTIF : Lister TOUS les cours visibles avec leurs COORDONNÉES.
     
+    RÈGLES HORAIRES STRICTES (Colonnes) :
+    - Col 1 : 07h45 - 09h45
+    - Col 2 : 10h00 - 12h00
+    - Col 3 : 13h30 - 15h30 (ATTENTION : Début à 13h30 précises)
+    - Col 4 : 15h45 - 17h45
+
     RÈGLES VISUELLES :
-    1. **Dates** : Repère les dates de début de semaine à gauche (ex: "12/janv").
-    2. **Cours** : Lis le contenu des cases.
+    1. **Dates** : Repère les dates à gauche (ex: "12/janv").
+    2. **Cours** : Lis le contenu.
     3. **Couleurs** :
-       - Fond NOIR -> IGNORE (Cours annulé/Sport).
-       - Fond JAUNE -> Marque "is_exam": true.
+       - Fond NOIR = IGNORE.
+       - Fond JAUNE = EXAMEN ("is_exam": true).
 
     FORMAT DE SORTIE JSON :
     [
@@ -100,8 +107,10 @@ def extract_schedule_with_geometry(image, model_list):
       }},
       {{
         "type": "COURSE",
-        "day_name": "Lundi" (ou Mardi...),
-        "summary": "Matière (Prof)",
+        "day_name": "Lundi/Mardi...",
+        "summary": "Matière (Prof) /Groupe",
+        "start": "HH:MM",
+        "end": "HH:MM",
         "location": "Salle",
         "box_2d": [ymin, xmin, ymax, xmax],
         "is_exam": true/false
@@ -126,38 +135,39 @@ def extract_schedule_with_geometry(image, model_list):
             continue
     return []
 
-def geometric_processing(raw_items):
+def geometric_filtering_and_dating(raw_items):
     """
-    1. Associe cours -> Semaine (Y)
-    2. Associe cours -> Jour (Texte)
-    3. Calcule l'heure exacte via la colonne (X)
-    4. Filtre HAUT vs BAS
-    5. Assigne les catégories (GB, GC, Commun, Examen)
+    Filtre les cours selon la géométrie (Haut/Bas) et les groupes (GA/GB/GC).
     """
     final_events = []
     
-    # Séparation
     date_labels = sorted([x for x in raw_items if x['type'] == 'DATE_LABEL'], key=lambda k: k['box_2d'][0])
     courses = [x for x in raw_items if x['type'] == 'COURSE']
     
-    if not date_labels: date_labels = [{'text': '12/janv', 'box_2d': [0, 0, 1000, 0]}]
+    print(f"   📊 Structure : {len(date_labels)} semaines, {len(courses)} cours.")
 
-    # --- 1. CLASSEMENT PAR SEMAINE ---
+    if not date_labels:
+        date_labels = [{'text': '12/janv', 'box_2d': [0, 0, 1000, 0]}]
+
     courses_by_week = {i: [] for i in range(len(date_labels))}
+    
     for c in courses:
         c_y = c['box_2d'][0]
         week_idx = -1
         for i, lbl in enumerate(date_labels):
             if c_y >= lbl['box_2d'][0] - 50:
                 week_idx = i
-            else: break
-        if week_idx >= 0: courses_by_week[week_idx].append(c)
+            else:
+                break
+        if week_idx >= 0:
+            courses_by_week[week_idx].append(c)
 
-    # --- 2. TRAITEMENT PAR SEMAINE ---
     for idx, week_courses in courses_by_week.items():
         week_text = date_labels[idx]['text']
-        week_start_str = parse_date_string(week_text) or "2026-01-12"
-        
+        week_start_str = parse_date_string(week_text)
+        if not week_start_str: 
+            week_start_str = "2026-01-12"
+            
         print(f"      🗓️ Semaine {week_text} ({week_start_str})...")
         
         days = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"]
@@ -169,88 +179,55 @@ def geometric_processing(raw_items):
                     courses_by_day[d].append(c)
                     break
         
-        # --- 3. TRAITEMENT PAR JOUR ---
         for day_name, day_items in courses_by_day.items():
             if not day_items: continue
             
-            # Limites verticales de la ligne (Journée)
             y_mins = [x['box_2d'][0] for x in day_items]
             y_maxs = [x['box_2d'][2] for x in day_items]
+            
             row_top = min(y_mins)
             row_bottom = max(y_maxs)
+            row_height = row_bottom - row_top
             row_center = (row_top + row_bottom) / 2
-            buffer = (row_bottom - row_top) * 0.1 # 10% de marge
+            buffer = row_height * 0.1 
             
             for c in day_items:
-                summary = c.get('summary', '').strip()
-                summary_upper = summary.upper()
+                c_center = (c['box_2d'][0] + c['box_2d'][2]) / 2
+                summary = c.get('summary', '').upper()
                 
-                # --- A. RECALAGE HORAIRE (SNAP X) ---
-                # On détermine l'heure selon la colonne (position X)
-                # 0-1000 de large. 4 colonnes environ égales.
-                x_center = (c['box_2d'][1] + c['box_2d'][3]) / 2
-                
-                if x_center < 250:
-                    start, end = "074500", "094500"
-                elif x_center < 500:
-                    start, end = "100000", "120000"
-                elif x_center < 750:
-                    start, end = "133000", "153000" # 13h30
-                else:
-                    start, end = "154500", "174500"
-                
-                c['s_time'] = start
-                c['e_time'] = end
+                # 1. FILTRE GROUPE INTERDIT (GA)
+                if "/GA" in summary or "(GA)" in summary or "/ GA" in summary:
+                     # print(f"         🗑️ Rejet (Tag GA): {summary}")
+                     continue
 
-                # --- B. FILTRAGE ET TYPAGE ---
-                category = None # GB, GC, COMMUN, EXAMEN, REJET
+                # 2. FILTRE GÉOMÉTRIQUE (HAUT)
+                # Si le cours est en haut
+                if c_center < (row_center - buffer):
+                    # On rejette SI ce n'est pas marqué GB ou GC
+                    if "GB" not in summary and "GC" not in summary:
+                        print(f"         🗑️ Rejet (Position HAUT): {c.get('summary')}")
+                        continue
                 
-                # 1. Tags explicites
-                is_ga = "/GA" in summary_upper or "(GA)" in summary_upper
-                is_gc = "/GC" in summary_upper or "(GC)" in summary_upper
-                is_gb = "/GB" in summary_upper or "(GB)" in summary_upper
-                is_exam = c.get('is_exam') or "EXAMEN" in summary_upper or "EVAL" in summary_upper
+                # 3. TAGGING POUR DISTINCTION (GC / GB)
+                prefix = ""
+                if "GC" in summary:
+                    prefix = "[GC] "
+                elif "GB" in summary:
+                    prefix = "[GB] "
                 
-                # 2. Position Géométrique
-                c_y_center = (c['box_2d'][0] + c['box_2d'][2]) / 2
-                is_top_half = c_y_center < (row_center - buffer)
-                is_bottom_half = c_y_center > (row_center + buffer)
-                is_unique = not is_top_half and not is_bottom_half # Centré
+                # Nettoyage visuel du summary pour l'agenda
+                # On évite de dupliquer si déjà présent
+                original_summary = c.get('summary', '')
+                if prefix and not original_summary.startswith("["):
+                     c['summary'] = prefix + original_summary
 
-                # --- LOGIQUE DE DECISION ---
-                
-                if is_ga:
-                    category = "REJET"
-                elif "SPORT" in summary_upper and not is_exam:
-                    category = "REJET"
-                elif is_exam:
-                    category = "EXAMEN"
-                elif is_gc:
-                    category = "GC"
-                elif is_gb:
-                    category = "GB"
-                else:
-                    # Pas de tag explicite, on juge par la position
-                    if is_top_half:
-                        # Haut sans tag = GA (souvent) -> Rejet
-                        # Sauf si on veut absolument garder GC qui serait en haut ?
-                        # Dans le doute, Haut = GA.
-                        category = "REJET"
-                    elif is_bottom_half:
-                        # Bas sans tag = GB
-                        category = "GB"
-                    else:
-                        # Unique/Centré = Commun
-                        category = "COMMUN"
-                
-                if category == "REJET":
+                # 4. FILTRE SPORT (Sécurité)
+                if "SPORT" in summary and "EXAMEN" not in summary:
                     continue
 
-                # Calcul Date
                 day_offset = days.index(day_name)
                 dt = datetime.strptime(week_start_str, "%Y-%m-%d") + timedelta(days=day_offset)
-                c['real_date'] = dt.strftime("%Y%m%d")
-                c['category_type'] = category
+                c['real_date'] = dt.strftime("%Y-%m-%d")
                 
                 final_events.append(c)
 
@@ -258,7 +235,7 @@ def geometric_processing(raw_items):
 
 def parse_date_string(date_str):
     try:
-        clean = date_str.lower().replace("janv", "01").replace("févr", "02").replace("mars", "03").strip()
+        clean = date_str.lower().replace("janv", "01").replace("févr", "02").replace("mars", "03").replace("avr", "04").strip()
         clean = re.sub(r"[^0-9/]", "", clean)
         day, month = clean.split('/')
         return f"2026-{month.zfill(2)}-{day.zfill(2)}"
@@ -268,46 +245,31 @@ def create_ics(events):
     ics = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
-        "PRODID:-//STRI//Groupe GB//FR",
+        "PRODID:-//STRI//Groupe GB-GC//FR",
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH"
     ]
-    
     for evt in events:
-        cat = evt['category_type']
-        summary = evt['summary']
-        
-        # Décoration du titre selon la catégorie
-        if cat == "EXAMEN":
-            prefix = "🔴 [EXAMEN]"
-            prio = "1"
-        elif cat == "GC":
-            prefix = "🫐 [GC]"
-            prio = "5"
-        elif cat == "GB":
-            prefix = "🌿 [GB]"
-            prio = "5"
-        elif cat == "COMMUN":
-            prefix = "🔵"
-            prio = "5"
-        else:
-            prefix = ""
-            prio = "5"
+        try:
+            d = evt['real_date'].replace('-', '')
+            s = evt['start'].replace(':', '') + "00"
+            e = evt['end'].replace(':', '') + "00"
+            summary = evt['summary']
             
-        # On évite les doubles tags
-        if "EXAMEN" in summary.upper(): summary = summary.replace("EXAMEN", "").replace("🔴", "").strip()
-        final_summary = f"{prefix} {summary}".strip()
+            prio = "5"
+            if evt.get('is_exam') or "EXAMEN" in summary.upper():
+                if "🔴" not in summary: summary = "🔴 [EXAMEN] " + summary.replace("[EXAMEN]", "").strip()
+                prio = "1"
 
-        ics.append("BEGIN:VEVENT")
-        ics.append(f"DTSTART:{evt['real_date']}T{evt['s_time']}")
-        ics.append(f"DTEND:{evt['real_date']}T{evt['e_time']}")
-        ics.append(f"SUMMARY:{final_summary}")
-        ics.append(f"LOCATION:{evt.get('location', '')}")
-        ics.append(f"PRIORITY:{prio}")
-        ics.append(f"CATEGORIES:{cat}") # Metadonnée utile
-        ics.append("DESCRIPTION:Groupe GB/GC")
-        ics.append("END:VEVENT")
-        
+            ics.append("BEGIN:VEVENT")
+            ics.append(f"DTSTART:{d}T{s}")
+            ics.append(f"DTEND:{d}T{e}")
+            ics.append(f"SUMMARY:{summary}")
+            ics.append(f"LOCATION:{evt.get('location', '')}")
+            ics.append(f"PRIORITY:{prio}")
+            ics.append("DESCRIPTION:Groupe GB et GC")
+            ics.append("END:VEVENT")
+        except: continue
     ics.append("END:VCALENDAR")
     return "\n".join(ics)
 
@@ -334,15 +296,21 @@ def main():
     print(f"Traitement de {len(images)} pages...")
     for i, img in enumerate(images):
         print(f"--- Page {i+1} ---")
+        
+        # 1. Noircissement Orange
         clean_img = preprocess_destructive(img)
+        
+        # 2. Extraction Géométrique
         raw_items = extract_schedule_with_geometry(clean_img, models)
         
+        # 3. Filtrage Logique
         if raw_items:
-            valid_events = geometric_processing(raw_items)
+            valid_events = geometric_filtering_and_dating(raw_items)
             all_events.extend(valid_events)
             print(f"   ✅ {len(valid_events)} cours validés.")
         else:
             print("   ❌ Echec extraction.")
+            
         time.sleep(2)
 
     print("Génération ICS...")
