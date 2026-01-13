@@ -8,12 +8,11 @@ from pytz import timezone
 
 # --- CONFIGURATION ---
 PDF_URL = "https://stri.fr/Gestion_STRI/TAV/L3/EDT_STRI1A_L3IRT_TAV.pdf"
-MY_GROUP = "GB"    # Ton groupe
-IGNORE_GROUP = "GC" # Groupe à ignorer
+MY_GROUP = "GB"
+IGNORE_GROUP = "GC"
 TZ = timezone('Europe/Paris')
-YEAR = 2026        # Année cible (2026 car 12 janv = Lundi en 2026)
 
-# Désactiver les warnings SSL
+# Désactiver les alertes SSL
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 PROFS = {
@@ -48,8 +47,14 @@ def parse_month(month_str):
         if k in clean: return v
     return None
 
+def get_academic_year(month_target):
+    now = datetime.now()
+    if now.month >= 9:
+        return now.year + 1 if month_target < 9 else now.year
+    else:
+        return now.year - 1 if month_target >= 9 else now.year
+
 def is_exam(rect):
-    # Jaune = (1, 1, 0) approx
     if not rect.get('non_stroking_color'): return False
     c = rect['non_stroking_color']
     return len(c) >= 3 and c[0] > 0.8 and c[1] > 0.8 and c[2] < 0.5
@@ -59,42 +64,60 @@ def extract_schedule():
     
     with pdfplumber.open("edt.pdf") as pdf:
         for page_num, page in enumerate(pdf.pages):
-            print(f"--- Traitement Page {page_num + 1} ---")
-            words = page.extract_words(x_tolerance=3, y_tolerance=3)
-            rects = page.rects
-
-            # 1. Calibrage X (Heures)
-            hours_map = {}
-            for w in words:
+            print(f"--- Page {page_num + 1} ---")
+            
+            raw_words = page.extract_words(x_tolerance=3, y_tolerance=3)
+            
+            # 1. ANCRAGE TEMPOREL PRÉCIS
+            # On cherche "8h" et "18h" (ou max) pour définir l'échelle
+            hours_anchors = {}
+            for w in raw_words:
                 txt = w['text'].strip()
-                if re.match(r'^\d{1,2}h$', txt):
+                if w['top'] > 100: continue # Ignorer les heures dans le corps du texte
+                
+                # Regex stricte pour trouver les entêtes horaires
+                if re.match(r'^(8|9|10|11|12|13|14|15|16|17|18|19)h$', txt):
                     try:
                         h = int(txt.replace('h', ''))
-                        hours_map[h] = w['x0']
+                        hours_anchors[h] = w['x0']
                     except: pass
+
+            if 8 not in hours_anchors:
+                # Si on ne trouve pas 8h, on essaie de déduire avec 9h
+                if 9 in hours_anchors:
+                    hours_anchors[8] = hours_anchors[9] - (hours_anchors.get(10, 0) - hours_anchors[9])
+                else:
+                    print("Impossible de calibrer l'heure (pas de 8h/9h). Page ignorée.")
+                    continue
             
-            if len(hours_map) < 2: continue
+            # Calcul du ratio Pixels / Heure
+            # On prend les deux ancres les plus éloignées
+            min_h, max_h = min(hours_anchors.keys()), max(hours_anchors.keys())
+            if max_h == min_h: max_h = min_h + 1 # Sécurité
             
-            min_h, max_h = min(hours_map.keys()), max(hours_map.keys())
-            px_start, px_end = hours_map[min_h], hours_map[max_h]
-            px_per_hour = (px_end - px_start) / (max_h - min_h) if max_h > min_h else 100
+            px_start = hours_anchors[min_h]
+            px_end = hours_anchors[max_h]
+            px_per_hour = (px_end - px_start) / (max_h - min_h)
 
             def x_to_time(x):
-                hours = min_h + (x - px_start) / px_per_hour
-                total_min = int(hours * 60)
+                # On calcule par rapport à l'ancre 8h (ou min_h)
+                offset_pixels = x - hours_anchors[min_h]
+                offset_hours = offset_pixels / px_per_hour
+                actual_time = min_h + offset_hours
+                
+                total_min = int(actual_time * 60)
                 # Arrondi 15 min
                 rem = total_min % 15
                 if rem < 8: total_min -= rem
                 else: total_min += (15 - rem)
                 return int(total_min // 60), int(total_min % 60)
 
-            # 2. Découpage Y (Jours)
+            # 2. DÉTECTION DES JOURS
             days = []
             day_names = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"]
             week_date = None
             
-            # Date du Lundi
-            for w in words:
+            for w in raw_words:
                 if '/' in w['text'] and w['x0'] < 150:
                     parts = w['text'].split('/')
                     if len(parts) >= 2:
@@ -102,153 +125,128 @@ def extract_schedule():
                         if m:
                             d_str = re.sub(r'\D', '', parts[0])
                             if d_str:
-                                week_date = datetime(YEAR, m, int(d_str))
+                                year = get_academic_year(m)
+                                week_date = datetime(year, m, int(d_str))
                                 break
             
             if not week_date: continue
 
-            # Zones Y
-            sorted_by_y = sorted([w for w in words if w['text'] in day_names and w['x0'] < 150], key=lambda w: w['top'])
-            for i, w in enumerate(sorted_by_y):
+            headers = sorted([w for w in raw_words if w['text'] in day_names and w['x0'] < 150], key=lambda w: w['top'])
+            for i, w in enumerate(headers):
                 d_idx = day_names.index(w['text'])
                 y_top = w['top']
-                y_bottom = sorted_by_y[i+1]['top'] if i < len(sorted_by_y)-1 else page.height
+                y_bottom = headers[i+1]['top'] if i < len(headers)-1 else page.height
                 days.append({
                     'date': week_date + timedelta(days=d_idx),
-                    'y_top': y_top,
-                    'y_bottom': y_bottom
+                    'y_top': y_top, 'y_bottom': y_bottom, 'height': y_bottom - y_top
                 })
 
-            # 3. Extraction Cours (Cluster strict)
-            content = [w for w in words if w['x0'] > px_start - 20]
-            
+            # 3. CONTENU (Filtrage des heures textes)
+            content_words = []
+            for w in raw_words:
+                # On exclut les entêtes et les textes type "8h" qui polluent
+                if w['x0'] < px_start - 20: continue 
+                if re.match(r'^\d{1,2}h$', w['text']): continue
+                content_words.append(w)
+
             for day in days:
-                # Mots du jour
-                d_words = [w for w in content if day['y_top'] <= w['top'] + w['height']/2 < day['y_bottom']]
-                d_words.sort(key=lambda w: w['x0']) # Tri gauche -> droite
+                d_words = [w for w in content_words if day['y_top'] <= w['top'] + w['height']/2 < day['y_bottom']]
+                d_words.sort(key=lambda w: w['x0'])
                 
                 blocks = []
                 if not d_words: continue
-
-                # Algorithme de découpage par "GAP" (Vide)
-                current_block = [d_words[0]]
                 
+                curr = [d_words[0]]
                 for w in d_words[1:]:
-                    prev = current_block[-1]
-                    # Si le mot est à plus de 60px (environ 45-50min) du précédent, on coupe
-                    gap = w['x0'] - prev['x1']
-                    # OU si le mot est sur une ligne très différente (superposition verticale)
-                    v_gap = abs(w['top'] - prev['top'])
-                    
-                    if gap > 60 or v_gap > 20:
-                        blocks.append(current_block)
-                        current_block = [w]
+                    prev = curr[-1]
+                    # On coupe si écart horizontal OU écart vertical significatif
+                    if (w['x0'] - prev['x1'] > 40) or (abs(w['top'] - prev['top']) > 30):
+                        blocks.append(curr)
+                        curr = [w]
                     else:
-                        current_block.append(w)
-                blocks.append(current_block)
+                        curr.append(w)
+                blocks.append(curr)
 
-                # Traitement des blocs
-                final_events = []
                 for b in blocks:
-                    text = " ".join([w['text'] for w in b])
+                    raw_txt = " ".join([w['text'] for w in b])
+                    clean_txt = re.sub(r'\b\d{1,2}h\b', '', raw_txt).strip()
                     
-                    # Filtres basiques
-                    if re.match(r'^\d{1,2}h$', text): continue
-                    if "Page" in text and len(text) < 10: continue
+                    if len(clean_txt) < 3: continue
+                    if re.match(r'^(U\d[-\w]+|Amphi)$', clean_txt): continue
 
-                    # Calcul Géométrie
-                    b_x0 = min(w['x0'] for w in b)
-                    b_x1 = max(w['x1'] for w in b)
-                    b_y = sum(w['top'] for w in b) / len(b) # Y moyen
+                    # GEOMETRIE DU BLOC
+                    b_top = min(w['top'] for w in b)
+                    b_bottom = max(w['bottom'] for w in b)
+                    b_height = b_bottom - b_top
+                    b_center_y = (b_top + b_bottom) / 2
+                    
+                    # --- FILTRAGE CRITIQUE "LIGNE DU HAUT" ---
+                    # 1. Position relative dans la case jour (0.0 = haut, 1.0 = bas)
+                    day_center = (day['y_top'] + day['y_bottom']) / 2
+                    is_top_half = b_center_y < day_center
+                    
+                    # 2. Est-ce un "demi-cours" (hauteur faible) ?
+                    # Un cours commun fait toute la hauteur (~90-100% disons > 70%)
+                    # Un cours divisé fait ~50% ou moins
+                    is_split_row = b_height < (day['height'] * 0.7)
 
-                    # Filtre Groupe TEXTUEL
-                    if IGNORE_GROUP in text and MY_GROUP not in text: continue
+                    # LOGIQUE DE REJET :
+                    # Si c'est un cours "demi-hauteur" ET qu'il est dans la moitié haute -> C'est GC.
+                    if is_split_row and is_top_half:
+                        # Exception : Si ça contient explicitement "GB", on garde
+                        if MY_GROUP in clean_txt:
+                            pass
+                        elif "Commun" in clean_txt: # Parfois écrit
+                            pass
+                        else:
+                            print(f"   [REJETÉ] Ligne Haute (GC): {clean_txt}")
+                            continue
 
-                    # Nettoyage Profs
-                    clean = text
+                    # Filtre Texte Classique
+                    if IGNORE_GROUP in clean_txt and MY_GROUP not in clean_txt:
+                        print(f"   [REJETÉ] Groupe {IGNORE_GROUP}: {clean_txt}")
+                        continue
+                    
+                    # Remplacement Profs
+                    final_txt = clean_txt
                     for k, v in PROFS.items():
-                        clean = clean.replace(f"({k})", f"({v})")
+                        final_txt = final_txt.replace(f"({k})", f"({v})")
 
-                    # Heures
-                    h_start, m_start = x_to_time(b_x0)
-                    h_end, m_end = x_to_time(b_x1)
+                    # Temps
+                    b_x0, b_x1 = min(w['x0'] for w in b), max(w['x1'] for w in b)
+                    h_s, m_s = x_to_time(b_x0)
+                    h_e, m_e = x_to_time(b_x1)
                     
-                    if h_start < 7: h_start = 7
-                    if h_end > 20: h_end = 20
+                    if h_s < 7: h_s = 7
+                    if h_e > 21: h_e = 21
                     
-                    start = day['date'].replace(hour=h_start, minute=m_start, tzinfo=TZ)
-                    end = day['date'].replace(hour=h_end, minute=m_end, tzinfo=TZ)
+                    start = day['date'].replace(hour=h_s, minute=m_s, tzinfo=TZ)
+                    end = day['date'].replace(hour=h_e, minute=m_e, tzinfo=TZ)
                     
-                    if (end - start).total_seconds() < 1800: continue # Trop court
+                    if (end - start).total_seconds() < 1800: continue
 
-                    # Détection Exam
-                    exam = False
-                    mx, my = (b_x0+b_x1)/2, (min(w['top'] for w in b) + max(w['bottom'] for w in b))/2
-                    for r in rects:
-                        if is_exam(r) and r['x0'] < mx < r['x1'] and r['top'] < my < r['bottom']:
-                            exam = True
-                    
                     # Salle
                     loc = ""
-                    s_match = re.search(r'(U\d[-\w]+|Amphi)', text)
-                    if s_match: loc = s_match.group(0)
+                    lm = re.search(r'(U\d[-\w/]+|Amphi)', clean_txt)
+                    if lm: loc = lm.group(0)
 
-                    final_events.append({
-                        'name': f"{'EXAM: ' if exam else ''}{clean}",
-                        'start': start, 'end': end,
-                        'loc': loc,
-                        'y': b_y,  # Pour gérer les superpositions
-                        'text': text
-                    })
+                    # Exam
+                    is_ex = False
+                    mx, my = (b_x0+b_x1)/2, b_center_y
+                    for r in page.rects:
+                        if is_exam(r) and r['x0']<mx<r['x1'] and r['top']<my<r['bottom']:
+                            is_ex = True
 
-                # GESTION DES SUPERPOSITIONS (Même heure, deux lignes)
-                # On regroupe les events qui se chevauchent temporellement
-                filtered_events = []
-                while final_events:
-                    curr = final_events.pop(0)
-                    overlaps = [curr]
-                    # Trouver ceux qui chevauchent curr
-                    others = []
-                    for other in final_events:
-                        # Chevauchement si (StartA < EndB) et (EndA > StartB)
-                        if curr['start'] < other['end'] and curr['end'] > other['start']:
-                            overlaps.append(other)
-                        else:
-                            others.append(other)
-                    final_events = others # On continue avec ceux qui restent
-
-                    if len(overlaps) == 1:
-                        filtered_events.append(overlaps[0])
-                    else:
-                        # CONFLIT : On a plusieurs cours en même temps (Lignes haut/bas)
-                        # Stratégie : 
-                        # 1. Si l'un contient explicitement "GB", on le garde.
-                        # 2. Sinon, on garde celui qui est le plus BAS (Y plus grand) car "première ligne ne me concerne pas"
-                        
-                        keep = None
-                        # Check GB explicite
-                        for cand in overlaps:
-                            if MY_GROUP in cand['text']:
-                                keep = cand
-                                break
-                        
-                        # Sinon check position (Le plus grand Y = Le plus bas sur la page)
-                        if not keep:
-                            keep = max(overlaps, key=lambda x: x['y'])
-                        
-                        filtered_events.append(keep)
-
-                # Ajout au calendrier
-                for ev in filtered_events:
                     e = Event()
-                    e.name = ev['name']
-                    e.begin = ev['start']
-                    e.end = ev['end']
-                    e.location = ev['loc']
+                    e.name = f"{'EXAM: ' if is_ex else ''}{final_txt}"
+                    e.begin = start
+                    e.end = end
+                    e.location = loc
                     cal.events.add(e)
 
     with open("edt.ics", "w") as f:
         f.write(cal.serialize())
+    print("Génération terminée.")
 
 if __name__ == "__main__":
     download_pdf()
