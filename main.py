@@ -12,7 +12,7 @@ PDF_URL = "https://stri.fr/Gestion_STRI/TAV/L3/EDT_STRI1A_L3IRT_TAV.pdf"
 OUTPUT_FILE = "emploi_du_temps.ics"
 API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Mapping des profs
+# Liste des profs
 PROFS_DICT = """
 AnAn=Andréi ANDRÉI; AA=André AOUN; AB=Abdelmalek BENZEKRI; AL=Abir LARABA; BC=Bilal CHEBARO; 
 BTJ=Boris TIOMELA JOU; CC=Cédric CHAMBAULT; CG=Christine GALY; CT=Cédric TEYSSIE; EG=Eric GONNEAU; 
@@ -24,85 +24,94 @@ RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Th
 
 def clean_json_text(text):
     """Nettoie le texte pour extraire uniquement le JSON valide."""
-    # On cherche ce qui est entre [ et ]
-    match = re.search(r'\[.*\]', text, re.DOTALL)
-    if match:
-        return match.group(0)
-    # Sinon on essaie de nettoyer les balises markdown
-    text = text.replace("```json", "").replace("```", "").strip()
+    # Enlève les balises markdown ```json ... ```
+    text = re.sub(r"```json|```", "", text).strip()
+    # Trouve le début et la fin de la liste JSON [...]
+    start = text.find('[')
+    end = text.rfind(']')
+    if start != -1 and end != -1:
+        return text[start:end+1]
     return text
 
 def get_schedule_from_gemini(image):
-    # On utilise gemini-1.5-pro car il lit mieux les grilles complexes que flash
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={API_KEY}"
+    # On tente le modèle 'gemini-1.5-flash' qui est rapide et souvent dispo. 
+    # Si celui-ci échoue en 404, changez pour 'gemini-1.5-pro'
+    model_name = "gemini-1.5-flash-latest" 
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={API_KEY}"
     
     img_byte_arr = io.BytesIO()
     image.save(img_byte_arr, format='JPEG')
     b64_data = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
 
-    # On force l'année 2025 pour les dates (janvier/février)
+    # Année scolaire : Si on est après aout, on assume que l'année commence, sinon c'est la fin
     current_year = datetime.now().year
-    if datetime.now().month > 8: # Si on est en sept/oct, l'année scolaire commence
-        target_year = current_year + 1 # Janvier sera l'année suivante
-    else:
-        target_year = current_year
-
+    
     prompt = f"""
-    Analyse cet emploi du temps (image) pour le groupe "GB".
+    Rôle : Tu es un assistant précis qui convertit des images d'emploi du temps en données structurées.
     
-    CONTEXTE:
-    - Année : {target_year}
-    - Ignore les cours du groupe "GC".
-    - Ignore les lignes supérieures si une journée est coupée en deux.
-    - Ignore les cases ORANGE.
-    - Les heures : Lignes verticales = 15min. Début journée 07h45.
-    - Profs : Utilise ce mapping : {PROFS_DICT}
-
-    TACHE :
-    Extrais les cours sous forme de liste JSON stricte.
-    Format attendu :
+    TACHE : Analyse cette image pour l'étudiant du groupe "GB" UNIQUEMENT.
+    
+    RÈGLES VISUELLES STRICTES :
+    1.  **Lignes doubles** : Si une journée contient 2 lignes horizontales, REGARDE UNIQUEMENT LA LIGNE DU BAS. Ignore celle du haut.
+    2.  **Filtrage Groupe** : 
+        - Si un cours est marqué "/GC", IGNORE-LE.
+        - Si un cours est marqué "/GB", GARDE-LE.
+        - Si un cours n'a pas de groupe indiqué, GARDE-LE (cours commun).
+    3.  **Grille horaire** : Les lignes verticales marquent 15 minutes. Le début est à 07h45.
+        - 1er créneau standard : ~07h45 - 09h45
+        - 2e créneau standard : ~10h00 - 12h00
+        - 3e créneau standard : ~13h30 - 15h30
+        - 4e créneau standard : ~15h45 - 17h45
+        (Adapte selon la position visuelle exacte).
+    4.  **Dates** : Convertis les dates (ex: "Lundi 12/janv") en format "JJ/MM/AAAA". Utilise l'année {current_year} ou {current_year + 1} selon la logique scolaire.
+    5.  **Profs** : Remplace les initiales (ex: JGT) par {PROFS_DICT}.
+    
+    SORTIE :
+    Retourne UNIQUEMENT une liste JSON. Exemple :
     [
-      {{
-        "date": "JJ/MM/AAAA",
-        "start": "HH:MM",
-        "end": "HH:MM",
-        "summary": "Nom du cours + Prof",
-        "location": "Salle (carré vert)"
-      }}
+        {{
+            "summary": "Matière (Nom Prof)",
+            "start": "2025-01-12T07:45:00",
+            "end": "2025-01-12T09:45:00",
+            "location": "Salle U3-..."
+        }}
     ]
-    
-    Exemple de date : Si tu vois "Lundi 12/janv", mets "12/01/{target_year}".
+    Si aucun cours n'est trouvé pour le groupe GB, retourne une liste vide [].
     """
 
     payload = {
         "contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": b64_data}}]}],
-        "generationConfig": {"response_mime_type": "application/json"}, # Force le JSON
+        "generationConfig": {"response_mime_type": "application/json"},
         "safetySettings": [
-             {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-             {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-             {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-             {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
         ]
     }
 
-    headers = {'Content-Type': 'application/json'}
-    response = requests.post(url, headers=headers, data=json.dumps(payload))
+    response = requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
 
     if response.status_code != 200:
-        print(f"Erreur API: {response.text}")
+        print(f"Erreur API ({response.status_code}): {response.text}")
         return []
 
     try:
-        raw_text = response.json()['candidates'][0]['content']['parts'][0]['text']
+        raw_resp = response.json()
+        if 'candidates' not in raw_resp or not raw_resp['candidates']:
+            print("L'IA n'a rien renvoyé (Candidats vides).")
+            return []
+            
+        raw_text = raw_resp['candidates'][0]['content']['parts'][0]['text']
         clean_text = clean_json_text(raw_text)
         return json.loads(clean_text)
     except Exception as e:
-        print(f"Erreur parsing JSON: {e}")
-        print(f"Texte reçu: {raw_text if 'raw_text' in locals() else 'Rien'}")
+        print(f"Erreur lecture JSON : {e}")
+        print(f"Contenu brut reçu : {raw_text if 'raw_text' in locals() else 'Rien'}")
         return []
 
 def create_ics_file(events):
-    ics_content = [
+    ics_lines = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
         "PRODID:-//STRI//Groupe GB//FR",
@@ -110,58 +119,62 @@ def create_ics_file(events):
         "METHOD:PUBLISH"
     ]
     
-    for event in events:
+    for evt in events:
         try:
-            # Conversion date format JJ/MM/AAAA vers YYYYMMDD
-            d_parts = event['date'].split('/')
-            date_str = f"{d_parts[2]}{d_parts[1]}{d_parts[0]}"
+            # Nettoyage des dates pour format ICS (YYYYMMDDTHHMMSS)
+            start_dt = evt['start'].replace('-', '').replace(':', '') 
+            end_dt = evt['end'].replace('-', '').replace(':', '')
             
-            # Conversion heure HH:MM vers HHMMSS
-            start_str = event['start'].replace(':', '') + "00"
-            end_str = event['end'].replace(':', '') + "00"
+            # Ajout du Z si absent (UTC) ou gestion locale. Ici on reste simple.
+            # Pour être propre en iCal, il vaut mieux éviter les tirets/points
             
-            ics_content.append("BEGIN:VEVENT")
-            ics_content.append(f"DTSTART:{date_str}T{start_str}")
-            ics_content.append(f"DTEND:{date_str}T{end_str}")
-            ics_content.append(f"SUMMARY:{event['summary']}")
-            if event.get('location'):
-                ics_content.append(f"LOCATION:{event['location']}")
-            ics_content.append("DESCRIPTION:Groupe GB - Généré par IA")
-            ics_content.append("END:VEVENT")
+            ics_lines.append("BEGIN:VEVENT")
+            ics_lines.append(f"DTSTART:{start_dt}")
+            ics_lines.append(f"DTEND:{end_dt}")
+            ics_lines.append(f"SUMMARY:{evt.get('summary', 'Cours')}")
+            if 'location' in evt and evt['location']:
+                ics_lines.append(f"LOCATION:{evt['location']}")
+            ics_lines.append("DESCRIPTION:Groupe GB")
+            ics_lines.append("END:VEVENT")
         except Exception as e:
-            print(f"Event ignoré (données invalides) : {event} - {e}")
+            print(f"Event mal formé ignoré : {evt} ({e})")
             continue
 
-    ics_content.append("END:VCALENDAR")
-    return "\n".join(ics_content)
+    ics_lines.append("END:VCALENDAR")
+    return "\n".join(ics_lines)
 
 def main():
     if not API_KEY:
-        raise Exception("Clé API manquante")
+        raise Exception("Clé API manquante !")
 
-    print("Téléchargement du PDF...")
+    print(f"Téléchargement du PDF...")
     response = requests.get(PDF_URL)
-    images = convert_from_bytes(response.content)
+    if response.status_code != 200:
+        raise Exception("Erreur téléchargement PDF")
+
+    print("Conversion PDF -> Images (Haute Qualité)...")
+    # DPI=400 est CRUCIAL pour que l'IA lise les petits caractères
+    images = convert_from_bytes(response.content, dpi=400)
     
     all_events = []
 
     print(f"Traitement de {len(images)} pages...")
     for i, img in enumerate(images):
-        print(f"Analyse page {i+1}...")
+        print(f"--- Analyse Page {i+1} ---")
         events = get_schedule_from_gemini(img)
         if events:
-            print(f" -> {len(events)} cours trouvés sur cette page.")
+            print(f"{len(events)} événements trouvés.")
             all_events.extend(events)
         else:
-            print(" -> Aucun cours détecté.")
+            print("Aucun événement détecté sur cette page (ou erreur).")
 
     print("Génération du fichier ICS...")
-    ics_text = create_ics_file(all_events)
+    ics_content = create_ics_file(all_events)
     
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        f.write(ics_text)
+        f.write(ics_content)
     
-    print("Terminé.")
+    print("Terminé avec succès.")
 
 if __name__ == "__main__":
     main()
