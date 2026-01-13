@@ -21,13 +21,49 @@ OM=Olfa MECHI; PA=Patrick AUSTIN; PhA=Philippe ARGUEL; PIL=Pierre LOTTE; PL=Phil
 RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Thierry DESPRATS; TG=Thierry GAYRAUD.
 """
 
-def get_gemini_response(image):
-    # CORRECTION MAJEURE ICI :
-    # 1. On utilise 'gemini-1.5-flash-001' (version stable spécifique) au lieu de l'alias générique
-    # 2. On utilise l'URL directe pour éviter les bugs de librairie Python
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-001:generateContent?key={API_KEY}"
+def find_best_model():
+    """Demande à l'API quels modèles sont disponibles pour cette clé."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
+    try:
+        response = requests.get(url)
+        if response.status_code != 200:
+            print(f"Impossible de lister les modèles ({response.status_code}). Utilisation du défaut.")
+            return "gemini-1.5-flash"
+        
+        data = response.json()
+        models = [m['name'].replace('models/', '') for m in data.get('models', [])]
+        
+        # Ordre de préférence des modèles
+        preferences = [
+            "gemini-1.5-flash",
+            "gemini-1.5-flash-001",
+            "gemini-1.5-flash-latest",
+            "gemini-2.0-flash-exp",
+            "gemini-1.5-pro",
+            "gemini-1.5-pro-001"
+        ]
+        
+        print(f"Modèles disponibles pour votre clé : {models}")
+        
+        for pref in preferences:
+            if pref in models:
+                print(f"Modèle choisi : {pref}")
+                return pref
+        
+        # Si aucun favori n'est trouvé, on prend le premier qui contient "gemini"
+        for m in models:
+            if "gemini" in m and "vision" not in m: # On évite les vieux modèles vision-only
+                return m
+                
+        return "gemini-1.5-flash" # Fallback ultime
+        
+    except Exception as e:
+        print(f"Erreur lors de la recherche de modèle : {e}")
+        return "gemini-1.5-flash"
+
+def get_gemini_response(image, model_name):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={API_KEY}"
     
-    # Préparation de l'image
     img_byte_arr = io.BytesIO()
     image.save(img_byte_arr, format='JPEG')
     img_bytes = img_byte_arr.getvalue()
@@ -52,7 +88,7 @@ def get_gemini_response(image):
 
     SORTIE ATTENDUE (Format ICS Brut) :
     - Doit commencer par BEGIN:VCALENDAR et finir par END:VCALENDAR.
-    - Pas de balises markdown (```).
+    - Pas de balises markdown.
     - Pour chaque cours: SUMMARY (Matière + Prof), LOCATION (Salle), DTSTART, DTEND.
     """
 
@@ -74,8 +110,7 @@ def get_gemini_response(image):
     response = requests.post(url, headers=headers, data=json.dumps(payload))
 
     if response.status_code != 200:
-        # Affiche l'erreur exacte renvoyée par Google pour le débogage
-        raise Exception(f"Erreur API ({response.status_code}): {response.text}")
+        raise Exception(f"Erreur API ({response.status_code}) avec le modèle {model_name}: {response.text}")
 
     try:
         return response.json()['candidates'][0]['content']['parts'][0]['text']
@@ -84,7 +119,11 @@ def get_gemini_response(image):
 
 def main():
     if not API_KEY:
-        raise Exception("Erreur : La clé API GEMINI_API_KEY est introuvable dans les secrets.")
+        raise Exception("Erreur : La clé API GEMINI_API_KEY est introuvable.")
+
+    # 1. Trouver le bon modèle dynamiquement
+    print("Recherche du meilleur modèle disponible...")
+    best_model = find_best_model()
 
     print(f"Téléchargement du PDF...")
     response = requests.get(PDF_URL)
@@ -96,20 +135,22 @@ def main():
 
     full_ics_content = "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//STRI//Groupe GB//FR\nCALSCALE:GREGORIAN\n"
     
-    print(f"Traitement de {len(images)} pages...")
+    print(f"Traitement de {len(images)} pages avec le modèle '{best_model}'...")
     for i, img in enumerate(images):
-        print(f"Envoi page {i+1} à l'API...")
-        ics_part = get_gemini_response(img)
-        
-        # Nettoyage de la réponse
-        lines = ics_part.splitlines()
-        for line in lines:
-            line = line.strip()
-            if line.startswith("```"): continue
-            if line.startswith("BEGIN:VCALENDAR") or line.startswith("END:VCALENDAR") or line.startswith("VERSION:") or line.startswith("PRODID:"):
-                continue
-            if line:
-                full_ics_content += line + "\n"
+        print(f"   - Analyse page {i+1}...")
+        try:
+            ics_part = get_gemini_response(img, best_model)
+            
+            lines = ics_part.splitlines()
+            for line in lines:
+                line = line.strip()
+                if line.startswith("```"): continue
+                if line.startswith("BEGIN:VCALENDAR") or line.startswith("END:VCALENDAR") or line.startswith("VERSION:") or line.startswith("PRODID:"):
+                    continue
+                if line:
+                    full_ics_content += line + "\n"
+        except Exception as e:
+            print(f"Erreur sur la page {i+1}: {e}")
 
     full_ics_content += "END:VCALENDAR"
 
