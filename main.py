@@ -5,14 +5,15 @@ import base64
 import requests
 import re
 import time
+import numpy as np
 from pdf2image import convert_from_bytes
+from PIL import Image, ImageDraw
 
 # --- CONFIGURATION ---
 PDF_URL = "https://stri.fr/Gestion_STRI/TAV/L3/EDT_STRI1A_L3IRT_TAV.pdf"
 OUTPUT_FILE = "emploi_du_temps.ics"
 API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Mapping des professeurs
 PROFS_DICT = """
 AnAn=Andréi ANDRÉI; AA=André AOUN; AB=Abdelmalek BENZEKRI; AL=Abir LARABA; BC=Bilal CHEBARO; 
 BTJ=Boris TIOMELA JOU; CC=Cédric CHAMBAULT; CG=Christine GALY; CT=Cédric TEYSSIE; EG=Eric GONNEAU; 
@@ -23,7 +24,7 @@ RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Th
 """
 
 def get_available_models():
-    """Récupère les modèles disponibles."""
+    """Récupère la liste réelle des modèles activés pour votre clé."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
     try:
         response = requests.get(url)
@@ -39,6 +40,23 @@ def clean_json_text(text):
         return text[start:end+1]
     return text
 
+def preprocess_image(pil_image):
+    """
+    Efface chirurgicalement l'orange (info inutile) sans toucher au jaune (examen).
+    """
+    print("   🎨 Nettoyage des couleurs...")
+    img_array = np.array(pil_image)
+
+    # Détection de l'orange : Rouge élevé, Bleu faible, Vert "moyen" (l'orange est ~180, le jaune ~220)
+    red_cond = img_array[:, :, 0] > 200
+    blue_cond = img_array[:, :, 2] < 180
+    green_orange_cond = (img_array[:, :, 1] > 130) & (img_array[:, :, 1] < 205)
+
+    mask_orange = red_cond & blue_cond & green_orange_cond
+    img_array[mask_orange] = [255, 255, 255] # On remplace par du blanc
+
+    return Image.fromarray(img_array)
+
 def call_gemini_api(image, model_name):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={API_KEY}"
     
@@ -46,25 +64,24 @@ def call_gemini_api(image, model_name):
     image.save(img_byte_arr, format='JPEG')
     b64_data = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
 
-    # PROMPT : On demande à l'IA de qualifier chaque cours (Couleur, Position, Groupe)
-    # On délègue le filtrage au Python.
     prompt = f"""
-    Tu es un assistant de vision par ordinateur.
-    TACHE : Extrais TOUS les rectangles de cours visibles sur l'image.
+    Analyse cette image d'emploi du temps (nettoyée).
     ANNÉE : 2026.
 
-    POUR CHAQUE COURS, TU DOIS DÉTECTER 3 ATTRIBUTS VISUELS :
-    1. **background_color** : "ORANGE" (si fond orange/saumon), "JAUNE" (si fond jaune vif), "BLANC" (sinon).
-    2. **vertical_position** : "HAUT" (si le cours est sur la demi-ligne supérieure d'une journée divisée), "BAS" (si sur la demi-ligne inférieure), "UNIQUE" (si la ligne n'est pas divisée).
-    3. **text_content** : Le texte exact écrit (Matière, Prof, Salle, Groupe ex: /GC, /GA, /GB).
+    OBJECTIF : Lister TOUS les cours visibles, sans filtrer. Je filtrerai moi-même ensuite.
+
+    POUR CHAQUE COURS, DÉTECTE CES 3 ATTRIBUTS :
+    1. **background** : "JAUNE" (si fond jaune vif), "BLANC" (sinon). (L'orange a été effacé).
+    2. **position** : "HAUT" (si demi-ligne supérieure), "BAS" (si demi-ligne inférieure), "UNIQUE" (si ligne entière).
+    3. **text** : Le texte complet (Matière, Prof, Groupe ex: /GC, /GA, /GB).
 
     RÈGLES HORAIRES :
-    - Colonne 1 : 07h45 - 09h45
-    - Colonne 2 : 10h00 - 12h00
-    - Colonne 3 : 13h30 - 15h30
-    - Colonne 4 : 15h45 - 17h45
+    - Col 1 : 07h45 - 09h45
+    - Col 2 : 10h00 - 12h00
+    - Col 3 : 13h30 - 15h30 (Début 13h30 strict)
+    - Col 4 : 15h45 - 17h45
 
-    FORMAT DE SORTIE (JSON STRICT) :
+    FORMAT JSON STRICT :
     [
       {{
         "date": "2026-MM-JJ",
@@ -72,12 +89,12 @@ def call_gemini_api(image, model_name):
         "start": "HH:MM",
         "end": "HH:MM",
         "location": "Salle",
-        "background_color": "ORANGE/JAUNE/BLANC",
-        "vertical_position": "HAUT/BAS/UNIQUE",
-        "group_tag": "/GB ou /GC ou /GA ou AUCUN"
+        "background": "JAUNE/BLANC",
+        "position": "HAUT/BAS/UNIQUE",
+        "raw_text": "Texte complet lu"
       }}
     ]
-    Remplace les noms de profs selon : {PROFS_DICT}
+    Profs: {PROFS_DICT}
     """
 
     payload = {
@@ -94,73 +111,101 @@ def call_gemini_api(image, model_name):
     return requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
 
 def get_schedule_robust(image):
-    available = get_available_models()
-    # Priorité aux modèles intelligents pour bien détecter la position HAUT/BAS
+    # 1. On récupère TOUS les modèles disponibles
+    available_in_account = get_available_models()
+    
+    # 2. LISTE COMPLÈTE DE PRIORITÉ (Du plus intelligent au plus rapide)
     priority_list = [
+        # Les modèles "Pro" (Meilleure vision)
+        "gemini-2.5-pro",
         "gemini-1.5-pro",
         "gemini-1.5-pro-latest",
+        "gemini-1.5-pro-001",
+        
+        # Les modèles "Flash" récents (Rapides)
+        "gemini-2.5-flash",
         "gemini-2.0-flash",
-        "gemini-flash-latest"
+        "gemini-2.0-flash-001",
+        "gemini-2.0-flash-lite-preview-02-05",
+        
+        # Les "Classiques" (Très fiables en quota)
+        "gemini-1.5-flash",
+        "gemini-flash-latest",
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-flash-001"
     ]
-    models_to_try = [m for m in priority_list if m in available]
-    if not models_to_try: models_to_try = ["gemini-1.5-flash"]
 
-    print(f"   📋 Modèles testés : {models_to_try}")
+    # On croise les deux listes pour ne tester que ce qui existe
+    models_to_try = [m for m in priority_list if m in available_in_account]
+    
+    # Si la liste est vide (bug API), on force les classiques
+    if not models_to_try:
+        models_to_try = ["gemini-1.5-flash", "gemini-flash-latest"]
 
+    print(f"   📋 {len(models_to_try)} modèles prêts à être testés : {models_to_try}")
+
+    # Prétraitement unique
+    cleaned_img = preprocess_image(image)
+
+    # BOUCLE DE FAILOVER
     for model in models_to_try:
-        print(f"   👉 Appel API avec {model}...")
+        print(f"   👉 Tentative avec : {model}...")
         try:
-            response = call_gemini_api(image, model)
+            response = call_gemini_api(cleaned_img, model)
+
             if response.status_code == 200:
-                raw = response.json()
-                if 'candidates' in raw and raw['candidates']:
-                    clean = clean_json_text(raw['candidates'][0]['content']['parts'][0]['text'])
-                    data = json.loads(clean)
-                    print(f"      ✅ Reçu {len(data)} objets bruts.")
-                    return data
+                raw_resp = response.json()
+                if 'candidates' in raw_resp and raw_resp['candidates']:
+                    clean = clean_json_text(raw_resp['candidates'][0]['content']['parts'][0]['text'])
+                    return json.loads(clean)
+                else:
+                    print("      ⚠️ Réponse vide (IA muette). Suivant...")
+                    continue
+            
             elif response.status_code in [429, 503]:
-                print(f"      ⚠️ Surcharge {response.status_code}. Suivant...")
-                continue
+                print(f"      ⚠️ Bloqué ({response.status_code}). Suivant immédiat...")
+                continue # On passe direct au modèle suivant
             else:
-                print(f"      ❌ Erreur {response.status_code}.")
+                print(f"      ❌ Erreur {response.status_code}. Suivant...")
+                continue
+
         except Exception as e:
-            print(f"      ❌ Exception : {e}")
+            print(f"      ❌ Exception : {e}. Suivant...")
             continue
+
+    print("❌ ECHEC TOTAL : Aucun modèle n'a fonctionné.")
     return []
 
 def filter_events_strict(events):
-    """
-    C'est ICI que toute la magie opère. On filtre brutalement via le code.
-    """
     valid_events = []
     print(f"   🧹 Filtrage de {len(events)} événements bruts...")
     
     for evt in events:
         summary = evt.get('summary', '').upper()
-        bg_color = evt.get('background_color', 'BLANC').upper()
-        position = evt.get('vertical_position', 'UNIQUE').upper()
-        group_tag = evt.get('group_tag', '').upper()
+        raw_text = evt.get('raw_text', '').upper()
+        bg_color = evt.get('background', 'BLANC').upper()
+        position = evt.get('position', 'UNIQUE').upper()
 
         # RÈGLE 1 : Couleur ORANGE = POUBELLE
+        # (Normalement déjà effacé par le script, mais double sécurité)
         if "ORANGE" in bg_color:
-            print(f"      🗑️ Rejet (Couleur Orange) : {summary}")
             continue
             
-        # RÈGLE 2 : Position HAUT = POUBELLE (sauf si explicitement marqué GB)
-        if position == "HAUT" and "/GB" not in group_tag and "GB" not in summary:
-            print(f"      🗑️ Rejet (Position Haut/GA) : {summary}")
-            continue
-
-        # RÈGLE 3 : Tag de groupe explicite
-        if "/GA" in group_tag or "/GC" in group_tag or "(GA)" in summary or "(GC)" in summary:
+        # RÈGLE 2 : Groupe Explicitement Interdit dans le texte
+        if "/GA" in raw_text or "/GC" in raw_text or "(GA)" in summary or "(GC)" in summary:
             print(f"      🗑️ Rejet (Groupe GA/GC) : {summary}")
             continue
 
-        # Si on arrive ici, c'est bon !
-        # On nettoie le titre (on enlève les mentions de position inutiles)
+        # RÈGLE 3 : Position HAUT = POUBELLE (sauf si explicitement marqué GB)
+        # Si c'est en haut et qu'il n'y a PAS marqué "GB", on jette.
+        if position == "HAUT":
+            if "/GB" not in raw_text and "GB" not in summary:
+                print(f"      🗑️ Rejet (Position Haut sans GB) : {summary}")
+                continue
+
         valid_events.append(evt)
 
-    print(f"   ✅ {len(valid_events)} événements conservés pour l'agenda.")
+    print(f"   ✅ {len(valid_events)} événements conservés.")
     return valid_events
 
 def create_ics_file(events):
@@ -179,9 +224,8 @@ def create_ics_file(events):
             e = evt['end'].replace(':', '') + "00"
             
             summary = evt.get('summary', 'Cours')
-            bg_color = evt.get('background_color', '').upper()
+            bg_color = evt.get('background', '').upper()
             
-            # Gestion EXAMEN (Si Jaune ou mention explicite)
             priority = "5"
             if "JAUNE" in bg_color or "EXAMEN" in summary.upper():
                 summary = "🔴 [EXAMEN] " + summary.replace("[EXAMEN] ", "")
@@ -205,7 +249,6 @@ def main():
     print("Téléchargement PDF...")
     response = requests.get(PDF_URL)
     
-    # 300 DPI est suffisant si on ne fait pas de pixel-art
     print("Conversion PDF -> Images (300 DPI)...")
     images = convert_from_bytes(response.content, dpi=300) 
 
