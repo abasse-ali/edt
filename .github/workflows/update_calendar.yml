@@ -23,7 +23,8 @@ jobs:
       - name: Installer dépendances
         # CHANGEMENT ICI : on utilise la nouvelle lib google-genai
         run: |
-          pip install requests google-genai
+          pip install -U google-generativeai
+          pip install requests
 
       - name: Lancer le script d'extraction
         env:
