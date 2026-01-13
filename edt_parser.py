@@ -24,27 +24,22 @@ genai.configure(api_key=API_KEY)
 now = datetime.now(TZ)
 date_str = now.strftime("%A %d %B %Y")
 
-# --- PROMPT "CHIRURGICAL" ---
 SYSTEM_PROMPT = f"""
-Tu es un expert en extraction de données calendaires.
-Aujourd'hui nous sommes le {date_str}.
+Tu es un expert en extraction de données. Nous sommes le {date_str}.
 
 MISSION :
-Extrais l'emploi du temps de l'image pour l'étudiant du groupe "GB".
+Analyse cette image d'emploi du temps pour l'étudiant groupe "GB".
 
-RÈGLES D'OR DE NETTOYAGE (A RESPECTER SINON ÉCHEC) :
-1. **IGNORE** totalement les numéros de page (ex: "Page 1").
-2. **IGNORE** les textes qui ne sont QUE des salles (ex: "U3-Amphi", "U3-204", "Salle TP"). Un cours doit avoir un NOM (ex: "Télécoms", "Anglais").
-3. **CASE DIVISÉE** : Si une case horaire contient deux lignes séparées par un trait, garde UNIQUEMENT celle du BAS (C'est celle du groupe GB).
-4. **FORMATTITRE** : Le titre (summary) doit être PROPRE. 
-   - MAUVAIS : "U3-Amphi Télécoms JGT"
-   - BON : "Télécoms (Jean-Guy TARTARIN)"
-   - Ne mets PAS la salle dans le titre, mets-la dans le champ "location".
+RÈGLES DE NETTOYAGE :
+1. **IGNORE** les numéros de page ("Page 1", "1/2").
+2. **IGNORE** les textes qui ne sont QUE des salles ("U3-Amphi", "U3-204").
+3. **CASE DIVISÉE** : Si une case contient deux lignes séparées par un trait, garde UNIQUEMENT celle du BAS (C'est celle du groupe GB).
+4. **FORMATTITRE** : "Nom du cours (Prof)". Ne mets PAS la salle dans le titre.
 
 FORMAT DE SORTIE JSON STRICT :
 [
   {{
-    "summary": "Nom du cours nettoyé",
+    "summary": "Nom du cours",
     "location": "Salle",
     "start": "YYYY-MM-DD HH:MM", 
     "end": "YYYY-MM-DD HH:MM"
@@ -52,8 +47,9 @@ FORMAT DE SORTIE JSON STRICT :
 ]
 
 DATES :
-- Trouve la date du Lundi en haut (ex: 12/janv) et déduis l'année.
-- Renvoie les dates précises pour chaque cours.
+- Repère la date du Lundi en haut (ex: 12/janv).
+- Déduis l'année (probablement 2026).
+- Renvoie les dates précises (start/end) pour chaque cours.
 """
 
 def download_pdf():
@@ -63,9 +59,8 @@ def download_pdf():
     }
     try:
         r = requests.get(PDF_URL, headers=headers, verify=False, timeout=30)
-        content_type = r.headers.get('Content-Type', '').lower()
-        if 'html' in content_type:
-            print("ERREUR: Page HTML reçue. Le site bloque le téléchargement.")
+        if 'html' in r.headers.get('Content-Type', '').lower():
+            print("ERREUR: Page HTML reçue au lieu du PDF.")
             exit(1)
         with open("edt.pdf", "wb") as f:
             f.write(r.content)
@@ -74,30 +69,11 @@ def download_pdf():
         print(f"Erreur DL: {e}")
         exit(1)
 
-def clean_text(text):
-    """Nettoie les résidus de texte"""
-    if not text: return ""
-    # Enlève les espaces multiples
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
-
 def is_garbage(event):
-    """Détecte si un événement est un déchet"""
     s = event.get('summary', '').strip()
-    
-    # 1. C'est "Page 1" ?
-    if re.search(r'Page\s*\d+', s, re.IGNORECASE):
-        return True
-    
-    # 2. C'est juste une salle ? (ex: "U3-Amphi")
-    # Regex : Commence par U chiffre ou Amphi, et fait moins de 15 caractères
-    if re.match(r'^(U\d[-\w/]+|Amphi|Salle.*)$', s, re.IGNORECASE) and len(s) < 15:
-        return True
-        
-    # 3. C'est vide ou trop court ?
-    if len(s) < 3:
-        return True
-        
+    if re.search(r'Page\s*\d+', s, re.IGNORECASE): return True
+    if re.match(r'^(U\d[-\w/]+|Amphi|Salle.*)$', s, re.IGNORECASE) and len(s) < 15: return True
+    if len(s) < 3: return True
     return False
 
 def extract_schedule_ai():
@@ -106,7 +82,7 @@ def extract_schedule_ai():
         images = convert_from_path("edt.pdf")
     except Exception as e:
         print(f"Erreur Poppler: {e}")
-        exit(1)
+        return [] # Retourne liste vide au lieu de planter
 
     model = genai.GenerativeModel('gemini-1.5-flash')
     all_events = []
@@ -122,26 +98,13 @@ def extract_schedule_ai():
             
             try:
                 data = json.loads(text)
-            except json.JSONDecodeError:
-                print("Erreur : L'IA n'a pas renvoyé du JSON valide.")
+            except:
+                print("   L'IA n'a pas renvoyé de JSON valide.")
                 continue
 
-            # --- FILTRAGE IMPITOYABLE ---
-            valid_page_events = []
             for item in data:
-                # Nettoyage basique
-                item['summary'] = clean_text(item.get('summary', ''))
-                item['location'] = clean_text(item.get('location', ''))
-                
-                # Test si c'est un déchet
-                if is_garbage(item):
-                    print(f"   [SUPPRIMÉ] Déchet détecté : {item['summary']}")
-                    continue
-                
-                valid_page_events.append(item)
-            
-            print(f"   -> {len(valid_page_events)} cours valides conservés.")
-            all_events.extend(valid_page_events)
+                if not is_garbage(item):
+                    all_events.append(item)
             
         except Exception as e:
             print(f"Erreur IA Page {i+1}: {e}")
@@ -151,49 +114,42 @@ def extract_schedule_ai():
 def create_ics(events_data):
     cal = Calendar()
     
-    # Dédoublonnage (Même heure de début = doublon)
-    # On garde celui qui a le titre le plus long (souvent le plus complet)
+    # Dédoublonnage
     unique_events = {}
     for item in events_data:
-        key = item['start']
-        if key in unique_events:
-            current_len = len(unique_events[key].get('summary', ''))
-            new_len = len(item.get('summary', ''))
-            if new_len > current_len:
-                unique_events[key] = item
-        else:
+        key = f"{item['start']}_{item['summary'][:5]}" # Clé unique : Heure + début du titre
+        if key not in unique_events:
             unique_events[key] = item
 
-    print(f"Génération ICS avec {len(unique_events)} événements uniques...")
+    print(f"Génération ICS avec {len(unique_events)} événements...")
 
     for item in unique_events.values():
         try:
             e = Event()
-            e.name = item['summary']
-            e.location = item['location']
-            
+            e.name = item.get('summary', 'Cours')
+            e.location = item.get('location', '')
             dt_start = datetime.strptime(item['start'], "%Y-%m-%d %H:%M")
             dt_end = datetime.strptime(item['end'], "%Y-%m-%d %H:%M")
-            
             e.begin = TZ.localize(dt_start)
             e.end = TZ.localize(dt_end)
-            
             cal.events.add(e)
         except Exception as e:
-            print(f"Erreur création event: {e}")
+            print(f"Erreur event: {e}")
 
+    # ON ÉCRIT LE FICHIER MÊME S'IL EST VIDE (Pour éviter l'erreur git add)
     with open("edt.ics", "w") as f:
         f.write(cal.serialize())
-    print("Fichier ICS généré.")
+    print("Fichier edt.ics généré (Même si vide).")
 
 if __name__ == "__main__":
     if not API_KEY:
         print("ERREUR: Clé API manquante.")
+        # On crée un fichier vide pour ne pas casser le workflow
+        with open("edt.ics", "w") as f: f.write("BEGIN:VCALENDAR\nVERSION:2.0\nEND:VCALENDAR")
         exit(1)
     
     download_pdf()
     data = extract_schedule_ai()
-    if data:
-        create_ics(data)
-    else:
-        print("Aucun cours trouvé.")
+    
+    # ON APPELLE TOUJOURS CREATE_ICS
+    create_ics(data)
