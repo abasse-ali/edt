@@ -7,7 +7,7 @@ import re
 import time
 import numpy as np
 from pdf2image import convert_from_bytes
-from PIL import Image, ImageOps
+from PIL import Image
 from datetime import datetime, timedelta
 
 # --- CONFIGURATION ---
@@ -25,7 +25,6 @@ RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Th
 """
 
 def get_available_models():
-    """Récupère les modèles dispos."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
     try:
         response = requests.get(url)
@@ -42,86 +41,45 @@ def clean_json_text(text):
     return text
 
 def preprocess_destructive(pil_image):
-    """
-    Transforme l'ORANGE en NOIR pour masquer le texte 'Sport' ou les cours annulés.
-    """
+    # Noircissement de l'Orange (Sport) pour suppression
     img_array = np.array(pil_image)
-    
-    # ORANGE (#FFB84D)
     red_cond = img_array[:, :, 0] > 180
     green_cond = (img_array[:, :, 1] > 100) & (img_array[:, :, 1] < 210)
     blue_cond = img_array[:, :, 2] < 160
-    
     mask_orange = red_cond & green_cond & blue_cond
     img_array[mask_orange] = [0, 0, 0]
-    
     return Image.fromarray(img_array)
 
 def call_gemini(image, model_name, prompt):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={API_KEY}"
-    
     img_byte_arr = io.BytesIO()
     image.save(img_byte_arr, format='JPEG')
     b64_data = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
-
     payload = {
         "contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": b64_data}}]}],
         "generationConfig": {"response_mime_type": "application/json"},
-        "safetySettings": [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
-        ]
+        "safetySettings": [{"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"}, {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"}, {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"}, {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}]
     }
     return requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
 
 def extract_schedule_with_geometry(image, model_list):
-    """
-    Extraction avec géométrie et règles horaires strictes.
-    """
     prompt = f"""
-    Analyse cette image d'emploi du temps (multi-semaines).
-    ANNÉE : 2026.
-
-    OBJECTIF : Lister TOUT ce que tu vois (Matières, Dates) avec leurs COORDONNÉES.
+    Analyse l'emploi du temps (multi-semaines). Année 2026.
+    OBJECTIF : Lister TOUT avec COORDONNÉES.
     
-    RÈGLES HORAIRES STRICTES (Colonnes) :
-    - Col 1 : 07h45 - 09h45
-    - Col 2 : 10h00 - 12h00
-    - Col 3 : 13h30 - 15h30 (ATTENTION : Début à 13h30 précises)
-    - Col 4 : 15h45 - 17h45
-
     RÈGLES VISUELLES :
-    1. **Dates** : Repère les dates à gauche (ex: "12/janv").
-    2. **Cours** : Lis le contenu.
-    3. **Couleurs** :
-       - Fond NOIR = IGNORE.
-       - Fond JAUNE = EXAMEN ("is_exam": true).
-
-    FORMAT DE SORTIE JSON :
+    1. Dates à gauche (ex: 12/janv).
+    2. Couleurs : NOIR = IGNORE, JAUNE = EXAMEN.
+    
+    FORMAT JSON :
     [
-      {{
-        "type": "DATE_LABEL",
-        "text": "12/janv",
-        "box_2d": [ymin, xmin, ymax, xmax] (0-1000)
-      }},
-      {{
-        "type": "COURSE",
-        "day_name": "Lundi/Mardi...",
-        "summary": "Matière (Prof) /Groupe",
-        "start": "HH:MM",
-        "end": "HH:MM",
-        "location": "Salle",
-        "box_2d": [ymin, xmin, ymax, xmax],
-        "is_exam": true/false
-      }}
+      {{ "type": "DATE_LABEL", "text": "12/janv", "box_2d": [ymin, xmin, ymax, xmax] }},
+      {{ "type": "COURSE", "day_name": "Lundi...", "summary": "Matière", "start": "HH:MM", "end": "HH:MM", "location": "Salle", "box_2d": [ymin, xmin, ymax, xmax], "is_exam": true }}
     ]
     Profs: {PROFS_DICT}
     """
-    
     for model in model_list:
-        print(f"   👉 Analyse géométrique avec {model}...")
+        print(f"   👉 Extraction avec {model}...")
         try:
             resp = call_gemini(image, model, prompt)
             if resp.status_code == 200:
@@ -131,146 +89,136 @@ def extract_schedule_with_geometry(image, model_list):
             elif resp.status_code in [429, 503]:
                 print(f"      ⚠️ Surcharge ({resp.status_code}). Suivant...")
                 continue
-        except Exception as e:
-            print(f"      ❌ Erreur: {e}")
-            continue
+        except: continue
     return []
 
-def geometric_filtering_and_dating(raw_items):
+def filter_by_slot_duel(raw_items):
     """
-    Filtre STRICTEMENT les cours du HAUT.
+    FILTRAGE PAR DUEL : Comparaison directe Haut/Bas par créneau horaire.
     """
     final_events = []
     
     date_labels = sorted([x for x in raw_items if x['type'] == 'DATE_LABEL'], key=lambda k: k['box_2d'][0])
     courses = [x for x in raw_items if x['type'] == 'COURSE']
     
-    print(f"   📊 Structure : {len(date_labels)} semaines, {len(courses)} cours.")
+    if not date_labels: date_labels = [{'text': '12/janv', 'box_2d': [0, 0, 1000, 0]}]
 
-    if not date_labels:
-        date_labels = [{'text': '12/janv', 'box_2d': [0, 0, 1000, 0]}]
-
+    # 1. Associer cours aux semaines
     courses_by_week = {i: [] for i in range(len(date_labels))}
-    
     for c in courses:
         c_y = c['box_2d'][0]
         week_idx = -1
         for i, lbl in enumerate(date_labels):
-            if c_y >= lbl['box_2d'][0] - 50:
-                week_idx = i
-            else:
-                break
-        if week_idx >= 0:
-            courses_by_week[week_idx].append(c)
+            if c_y >= lbl['box_2d'][0] - 50: week_idx = i
+            else: break
+        if week_idx >= 0: courses_by_week[week_idx].append(c)
 
+    # 2. Traitement par semaine
     for idx, week_courses in courses_by_week.items():
         week_text = date_labels[idx]['text']
-        week_start_str = parse_date_string(week_text)
-        if not week_start_str: 
-            week_start_str = "2026-01-12"
-            
-        print(f"      🗓️ Semaine {week_text} ({week_start_str})...")
+        week_start_str = parse_date_string(week_text) or "2026-01-12"
+        print(f"      🗓️ Semaine {week_text}...")
         
-        days = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"]
-        courses_by_day = {d: [] for d in days}
+        # Grouper par JOUR + HEURE DE DÉBUT
+        # Clé = "Lundi_08", "Lundi_10", "Lundi_13", "Lundi_15"
+        slots = {} 
         
         for c in week_courses:
-            for d in days:
-                if d in c.get('day_name', ''):
-                    courses_by_day[d].append(c)
+            day = c.get('day_name', 'Lundi')
+            start_hour = c.get('start', '00:00').split(':')[0]
+            # Normalisation des heures (7h/8h/9h -> Slot 1, 10h/11h -> Slot 2...)
+            try:
+                h = int(start_hour)
+                if h < 10: slot_key = f"{day}_1"   # Matin 1
+                elif h < 13: slot_key = f"{day}_2" # Matin 2
+                elif h < 15: slot_key = f"{day}_3" # Aprèm 1
+                else: slot_key = f"{day}_4"        # Aprèm 2
+            except: slot_key = f"{day}_unknown"
+            
+            if slot_key not in slots: slots[slot_key] = []
+            slots[slot_key].append(c)
+            
+        # 3. LE DUEL
+        for key, slot_items in slots.items():
+            # Filtre préliminaire : Sport & GA explicite
+            clean_items = []
+            for item in slot_items:
+                summary = item.get('summary', '').upper()
+                if "SPORT" in summary and "EXAMEN" not in summary: continue
+                if "/GA" in summary or re.search(r'\bGA\b', summary): 
+                    # print(f"         🗑️ Rejet (Tag GA): {summary}")
+                    continue
+                clean_items.append(item)
+            
+            if not clean_items: continue
+
+            # Si 1 seul cours -> On garde (c'est le bon)
+            if len(clean_items) == 1:
+                winner = clean_items[0]
+            else:
+                # Si plusieurs cours : On trie par Y (Ymin = Haut, Ymax = Bas)
+                # Le plus petit Y est EN HAUT.
+                # On veut garder le plus grand Y (EN BAS).
+                clean_items.sort(key=lambda x: x['box_2d'][0]) # Tri croissant Y
+                
+                # Le dernier est le plus bas
+                winner = clean_items[-1] 
+                # Le premier est le plus haut (GA) -> Rejeté
+                loser = clean_items[0]
+                print(f"         ⚔️ DUEL {key}: Rejet HAUT ({loser['summary']}) / Garde BAS ({winner['summary']})")
+
+            # Traitement final du gagnant
+            summary = winner.get('summary', '')
+            
+            # Tagging GB/GC
+            if re.search(r'(\b|/|\()GC\b', summary.upper()):
+                if not summary.startswith("["): summary = "[GC] " + summary
+            elif re.search(r'(\b|/|\()GB\b', summary.upper()):
+                if not summary.startswith("["): summary = "[GB] " + summary
+                
+            winner['summary'] = summary
+            
+            # Date
+            days = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"]
+            day_offset = 0
+            for i, d in enumerate(days):
+                if d in winner.get('day_name', ''): 
+                    day_offset = i
                     break
-        
-        for day_name, day_items in courses_by_day.items():
-            if not day_items: continue
+            dt = datetime.strptime(week_start_str, "%Y-%m-%d") + timedelta(days=day_offset)
+            winner['real_date'] = dt.strftime("%Y-%m-%d")
             
-            # Calcul de la géométrie de la ligne (Journée entière)
-            y_mins = [x['box_2d'][0] for x in day_items]
-            y_maxs = [x['box_2d'][2] for x in day_items]
-            
-            row_top = min(y_mins)
-            row_bottom = max(y_maxs)
-            row_height = row_bottom - row_top
-            row_center = (row_top + row_bottom) / 2
-            
-            # Marge de tolérance (10%)
-            buffer = row_height * 0.1 
-            
-            for c in day_items:
-                c_center = (c['box_2d'][0] + c['box_2d'][2]) / 2
-                summary = c.get('summary', '').upper()
-                
-                # 1. FILTRE GÉOMÉTRIQUE STRICT (HAUT = POUBELLE)
-                # Si le centre du cours est au-dessus du centre de la ligne -> REJET INCONDITIONNEL
-                if c_center < (row_center - buffer):
-                    print(f"         🗑️ Rejet STRICT (Position HAUT): {c.get('summary')}")
-                    continue
-
-                # 2. FILTRE GROUPE INTERDIT (GA) - Sécurité supplémentaire
-                # Si GA est mentionné explicitement, on jette aussi (même si position basse, ce qui serait bizarre)
-                if re.search(r'(\b|/|\()GA\b', summary):
-                     print(f"         🗑️ Rejet (Tag GA): {c.get('summary')}")
-                     continue
-
-                # 3. TAGGING POUR DISTINCTION (GC / GB)
-                prefix = ""
-                if re.search(r'(\b|/|\()GC\b', summary):
-                    prefix = "[GC] "
-                elif re.search(r'(\b|/|\()GB\b', summary):
-                    prefix = "[GB] "
-                
-                # Application du tag
-                original_summary = c.get('summary', '')
-                if prefix and not original_summary.startswith("["):
-                     c['summary'] = prefix + original_summary
-
-                # 4. FILTRE SPORT (Sécurité couleur)
-                if "SPORT" in summary and "EXAMEN" not in summary:
-                    continue
-
-                # Datation
-                day_offset = days.index(day_name)
-                dt = datetime.strptime(week_start_str, "%Y-%m-%d") + timedelta(days=day_offset)
-                c['real_date'] = dt.strftime("%Y-%m-%d")
-                
-                final_events.append(c)
+            final_events.append(winner)
 
     return final_events
 
 def parse_date_string(date_str):
     try:
-        clean = date_str.lower().replace("janv", "01").replace("févr", "02").replace("mars", "03").replace("avr", "04").strip()
+        clean = date_str.lower().replace("janv", "01").replace("févr", "02").replace("mars", "03").strip()
         clean = re.sub(r"[^0-9/]", "", clean)
         day, month = clean.split('/')
         return f"2026-{month.zfill(2)}-{day.zfill(2)}"
     except: return None
 
 def create_ics(events):
-    ics = [
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//STRI//Groupe GB-GC//FR",
-        "CALSCALE:GREGORIAN",
-        "METHOD:PUBLISH"
-    ]
+    ics = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//STRI//Groupe GB//FR", "CALSCALE:GREGORIAN", "METHOD:PUBLISH"]
     for evt in events:
         try:
             d = evt['real_date'].replace('-', '')
             s = evt['start'].replace(':', '') + "00"
             e = evt['end'].replace(':', '') + "00"
-            summary = evt['summary']
-            
+            summ = evt['summary']
             prio = "5"
-            if evt.get('is_exam') or "EXAMEN" in summary.upper():
-                if "🔴" not in summary: summary = "🔴 [EXAMEN] " + summary.replace("[EXAMEN]", "").strip()
+            if evt.get('is_exam') or "EXAMEN" in summ.upper():
+                if "🔴" not in summ: summ = "🔴 [EXAMEN] " + summ.replace("[EXAMEN]", "").strip()
                 prio = "1"
-
             ics.append("BEGIN:VEVENT")
             ics.append(f"DTSTART:{d}T{s}")
             ics.append(f"DTEND:{d}T{e}")
-            ics.append(f"SUMMARY:{summary}")
+            ics.append(f"SUMMARY:{summ}")
             ics.append(f"LOCATION:{evt.get('location', '')}")
             ics.append(f"PRIORITY:{prio}")
-            ics.append("DESCRIPTION:Groupe GB et GC")
+            ics.append("DESCRIPTION:Groupe GB")
             ics.append("END:VEVENT")
         except: continue
     ics.append("END:VCALENDAR")
@@ -278,42 +226,26 @@ def create_ics(events):
 
 def main():
     if not API_KEY: raise Exception("Clé API manquante")
-
     avail = get_available_models()
-    prio = [
-        "gemini-3-pro-preview", "gemini-3-flash-preview",
-        "gemini-2.5-pro", "gemini-2.5-flash",
-        "gemini-2.0-flash-001", "gemini-2.0-flash-lite-preview-02-05",
-        "gemini-1.5-pro-latest", "gemini-1.5-pro", "gemini-1.5-flash-latest"
-    ]
-    models = [m for m in prio if m in avail]
-    if not models: models = ["gemini-1.5-flash"]
+    prio = ["gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash-001", "gemini-1.5-pro-latest"]
+    models = [m for m in prio if m in avail] or ["gemini-1.5-flash"]
     
     print(f"📋 Modèles : {models}")
     print("Téléchargement PDF...")
     response = requests.get(PDF_URL)
     images = convert_from_bytes(response.content, dpi=300) 
-
     all_events = []
 
     print(f"Traitement de {len(images)} pages...")
     for i, img in enumerate(images):
         print(f"--- Page {i+1} ---")
-        
-        # 1. Noircissement Orange
         clean_img = preprocess_destructive(img)
-        
-        # 2. Extraction Géométrique
-        raw_items = extract_schedule_with_geometry(clean_img, models)
-        
-        # 3. Filtrage Logique
-        if raw_items:
-            valid_events = geometric_filtering_and_dating(raw_items)
-            all_events.extend(valid_events)
-            print(f"   ✅ {len(valid_events)} cours validés.")
-        else:
-            print("   ❌ Echec extraction.")
-            
+        raw = extract_schedule_with_geometry(clean_img, models)
+        if raw:
+            valid = filter_by_slot_duel(raw)
+            all_events.extend(valid)
+            print(f"   ✅ {len(valid)} cours validés.")
+        else: print("   ❌ Echec.")
         time.sleep(2)
 
     print("Génération ICS...")
