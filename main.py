@@ -144,9 +144,32 @@ def get_schedule_robust(image, day_name):
     # Liste complète de modèles pour éviter l'échec
     available = get_available_models()
     priority_list = [
-        "gemini-1.5-pro", "gemini-1.5-pro-latest", # Les meilleurs pour le détail HAUT/BAS
-        "gemini-2.0-flash", "gemini-flash-latest",
-        "gemini-1.5-flash"
+        # --- GÉNÉRATION 3 (Le futur / Cutting Edge) ---
+        # Les plus intelligents actuellement, capacités de raisonnement "agentique" extrêmes.
+        "gemini-3-pro-preview",    # Le plus puissant absolu (Raisonnement profond)
+        "gemini-3-flash-preview",  # Plus intelligent que le 2.5 Pro mais rapide
+    
+        # --- GÉNÉRATION 2.5 (Le Standard Actuel / Stable) ---
+        # L'équilibre parfait et la version de production recommandée.
+        "gemini-2.5-pro",          # Le standard "Pro" stable (Penseur, codeur, multimodal)
+        "gemini-2.5-flash",        # Le "Flash" nouvelle génération (Polyvalent)
+        
+        # --- GÉNÉRATION 2.0 (L'ancienne référence) ---
+        # Toujours très capables, souvent utilisés en fallback.
+        "gemini-2.0-flash-001",    # (Note: Sera retiré courant 2026)
+        
+        # --- MODÈLES "LITE" (Optimisés pour la vitesse/coût) ---
+        # Moins "intelligents" sur les nuances, mais imbattables pour des tâches simples à haut volume.
+        "gemini-2.5-flash-lite",   
+        "gemini-2.0-flash-lite-preview-02-05",
+    
+        # --- GÉNÉRATION 1.5 (Legacy / Anciens) ---
+        # Gardés pour la compatibilité, mais dépassés par les versions 2.0+ et 2.5+.
+        "gemini-1.5-pro-latest",
+        "gemini-1.5-pro",
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-8b"      # Le plus petit, pour des tâches très basiques
     ]
     models = [m for m in priority_list if m in available]
     if not models: models = ["gemini-1.5-flash"]
