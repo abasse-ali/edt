@@ -5,15 +5,14 @@ import base64
 import requests
 import re
 import time
-import numpy as np
 from pdf2image import convert_from_bytes
-from PIL import Image, ImageDraw
 
 # --- CONFIGURATION ---
 PDF_URL = "https://stri.fr/Gestion_STRI/TAV/L3/EDT_STRI1A_L3IRT_TAV.pdf"
 OUTPUT_FILE = "emploi_du_temps.ics"
 API_KEY = os.environ.get("GEMINI_API_KEY")
 
+# Mapping des professeurs
 PROFS_DICT = """
 AnAn=Andréi ANDRÉI; AA=André AOUN; AB=Abdelmalek BENZEKRI; AL=Abir LARABA; BC=Bilal CHEBARO; 
 BTJ=Boris TIOMELA JOU; CC=Cédric CHAMBAULT; CG=Christine GALY; CT=Cédric TEYSSIE; EG=Eric GONNEAU; 
@@ -23,6 +22,15 @@ OM=Olfa MECHI; PA=Patrick AUSTIN; PhA=Philippe ARGUEL; PIL=Pierre LOTTE; PL=Phil
 RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Thierry DESPRATS; TG=Thierry GAYRAUD.
 """
 
+def get_available_models():
+    """Récupère les modèles disponibles."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
+    try:
+        response = requests.get(url)
+        if response.status_code != 200: return []
+        return [m['name'].replace('models/', '') for m in response.json().get('models', [])]
+    except: return []
+
 def clean_json_text(text):
     text = re.sub(r"```json|```", "", text).strip()
     start = text.find('[')
@@ -31,34 +39,6 @@ def clean_json_text(text):
         return text[start:end+1]
     return text
 
-def preprocess_image(pil_image):
-    """
-    Efface chirurgicalement l'orange sans toucher au jaune.
-    Orange (#FFB84D) : R=255, G=184, B=77
-    Jaune (#FFD966)  : R=255, G=217, B=102
-    Différence clé : Le canal VERT (G). 
-    Orange < 200 < Jaune.
-    """
-    print("   🎨 Nettoyage des couleurs...")
-    img_array = np.array(pil_image)
-
-    # On cible les pixels qui sont "colorés" (pas noirs, pas blancs)
-    # R > 200 (C'est une couleur claire)
-    # B < 150 (Il y a du jaune/orange, pas du bleu)
-    # 130 < G < 200 (C'est la zone ORANGE spécifique, le jaune est au-dessus de 200)
-    
-    red_cond = img_array[:, :, 0] > 200
-    blue_cond = img_array[:, :, 2] < 180
-    green_orange_cond = (img_array[:, :, 1] > 130) & (img_array[:, :, 1] < 205)
-
-    # Masque combiné : C'est de l'orange !
-    mask_orange = red_cond & blue_cond & green_orange_cond
-    
-    # On remplace l'orange par du BLANC pur
-    img_array[mask_orange] = [255, 255, 255]
-
-    return Image.fromarray(img_array)
-
 def call_gemini_api(image, model_name):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={API_KEY}"
     
@@ -66,31 +46,38 @@ def call_gemini_api(image, model_name):
     image.save(img_byte_arr, format='JPEG')
     b64_data = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
 
+    # PROMPT : On demande à l'IA de qualifier chaque cours (Couleur, Position, Groupe)
+    # On délègue le filtrage au Python.
     prompt = f"""
-    Analyse cette image d'emploi du temps (nettoyée).
+    Tu es un assistant de vision par ordinateur.
+    TACHE : Extrais TOUS les rectangles de cours visibles sur l'image.
     ANNÉE : 2026.
 
-    RÈGLES CRITIQUES :
-    1. **LIS TOUT** : Extrais le texte de tous les cours visibles.
-    2. **MENTIONNE LE GROUPE** : Si tu vois "/GA", "/GC" ou "/GB" écrit dans la case, ÉCRIS-LE dans le champ 'summary'. C'est vital.
-    3. **LIGNES DOUBLES** : Si une journée est coupée en deux lignes :
-       - La ligne du HAUT contient souvent "/GA" ou "/GC".
-       - La ligne du BAS contient souvent "/GB".
-       - Essaie de lire la ligne du bas en priorité, mais renvoie tout ce que tu vois. Je filtrerai après.
-    
-    4. **EXAMENS** : Les cases sur fond JAUNE sont des EXAMENS. Ajoute "[EXAMEN]" dans le titre si le fond est jaune.
+    POUR CHAQUE COURS, TU DOIS DÉTECTER 3 ATTRIBUTS VISUELS :
+    1. **background_color** : "ORANGE" (si fond orange/saumon), "JAUNE" (si fond jaune vif), "BLANC" (sinon).
+    2. **vertical_position** : "HAUT" (si le cours est sur la demi-ligne supérieure d'une journée divisée), "BAS" (si sur la demi-ligne inférieure), "UNIQUE" (si la ligne n'est pas divisée).
+    3. **text_content** : Le texte exact écrit (Matière, Prof, Salle, Groupe ex: /GC, /GA, /GB).
 
-    5. **HORAIRES** :
-       - Col 1 : 07h45-09h45
-       - Col 2 : 10h00-12h00
-       - Col 3 : 13h30-15h30 (Début 13h30 strict)
-       - Col 4 : 15h45-17h45
+    RÈGLES HORAIRES :
+    - Colonne 1 : 07h45 - 09h45
+    - Colonne 2 : 10h00 - 12h00
+    - Colonne 3 : 13h30 - 15h30
+    - Colonne 4 : 15h45 - 17h45
 
-    SORTIE JSON :
+    FORMAT DE SORTIE (JSON STRICT) :
     [
-      {{ "date": "2026-MM-JJ", "summary": "Matière /Groupe (Prof)", "start": "HH:MM", "end": "HH:MM", "location": "Salle" }}
+      {{
+        "date": "2026-MM-JJ",
+        "summary": "Matière (Prof)",
+        "start": "HH:MM",
+        "end": "HH:MM",
+        "location": "Salle",
+        "background_color": "ORANGE/JAUNE/BLANC",
+        "vertical_position": "HAUT/BAS/UNIQUE",
+        "group_tag": "/GB ou /GC ou /GA ou AUCUN"
+      }}
     ]
-    Profs: {PROFS_DICT}
+    Remplace les noms de profs selon : {PROFS_DICT}
     """
 
     payload = {
@@ -107,49 +94,74 @@ def call_gemini_api(image, model_name):
     return requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
 
 def get_schedule_robust(image):
-    # Prétraitement couleur agressif
-    cleaned_img = preprocess_image(image)
-    
-    models = ["gemini-1.5-pro", "gemini-1.5-pro-latest", "gemini-2.0-flash", "gemini-flash-latest"]
-    
-    for model in models:
-        print(f"   👉 Lecture avec : {model}...")
+    available = get_available_models()
+    # Priorité aux modèles intelligents pour bien détecter la position HAUT/BAS
+    priority_list = [
+        "gemini-1.5-pro",
+        "gemini-1.5-pro-latest",
+        "gemini-2.0-flash",
+        "gemini-flash-latest"
+    ]
+    models_to_try = [m for m in priority_list if m in available]
+    if not models_to_try: models_to_try = ["gemini-1.5-flash"]
+
+    print(f"   📋 Modèles testés : {models_to_try}")
+
+    for model in models_to_try:
+        print(f"   👉 Appel API avec {model}...")
         try:
-            response = call_gemini_api(cleaned_img, model)
+            response = call_gemini_api(image, model)
             if response.status_code == 200:
                 raw = response.json()
                 if 'candidates' in raw and raw['candidates']:
                     clean = clean_json_text(raw['candidates'][0]['content']['parts'][0]['text'])
-                    return json.loads(clean)
+                    data = json.loads(clean)
+                    print(f"      ✅ Reçu {len(data)} objets bruts.")
+                    return data
             elif response.status_code in [429, 503]:
-                print(f"      ⚠️ Surcharge ({response.status_code}). Suivant...")
+                print(f"      ⚠️ Surcharge {response.status_code}. Suivant...")
                 continue
-        except Exception:
+            else:
+                print(f"      ❌ Erreur {response.status_code}.")
+        except Exception as e:
+            print(f"      ❌ Exception : {e}")
             continue
     return []
 
-def filter_events_python(events):
+def filter_events_strict(events):
     """
-    Filtre ultime en Python : On supprime les cours qui ne concernent pas GB.
+    C'est ICI que toute la magie opère. On filtre brutalement via le code.
     """
-    final_events = []
-    print(f"   🧹 Filtrage Python de {len(events)} événements...")
+    valid_events = []
+    print(f"   🧹 Filtrage de {len(events)} événements bruts...")
     
     for evt in events:
         summary = evt.get('summary', '').upper()
-        
-        # 1. Suppression des groupes interdits (GA, GC, G1)
-        # On vérifie si "/GA", "/GC" sont présents.
-        # Attention : Parfois "CPO (GA)" ou "Informatique /GC"
-        if "/GC" in summary or "/GA" in summary or "(GA)" in summary or "(GC)" in summary:
-            print(f"      🗑️ Rejeté (Groupe incorrect) : {summary}")
+        bg_color = evt.get('background_color', 'BLANC').upper()
+        position = evt.get('vertical_position', 'UNIQUE').upper()
+        group_tag = evt.get('group_tag', '').upper()
+
+        # RÈGLE 1 : Couleur ORANGE = POUBELLE
+        if "ORANGE" in bg_color:
+            print(f"      🗑️ Rejet (Couleur Orange) : {summary}")
             continue
             
-        # 2. On garde le reste (GB ou rien)
-        final_events.append(evt)
-        
-    print(f"   ✅ Reste {len(final_events)} événements valides.")
-    return final_events
+        # RÈGLE 2 : Position HAUT = POUBELLE (sauf si explicitement marqué GB)
+        if position == "HAUT" and "/GB" not in group_tag and "GB" not in summary:
+            print(f"      🗑️ Rejet (Position Haut/GA) : {summary}")
+            continue
+
+        # RÈGLE 3 : Tag de groupe explicite
+        if "/GA" in group_tag or "/GC" in group_tag or "(GA)" in summary or "(GC)" in summary:
+            print(f"      🗑️ Rejet (Groupe GA/GC) : {summary}")
+            continue
+
+        # Si on arrive ici, c'est bon !
+        # On nettoie le titre (on enlève les mentions de position inutiles)
+        valid_events.append(evt)
+
+    print(f"   ✅ {len(valid_events)} événements conservés pour l'agenda.")
+    return valid_events
 
 def create_ics_file(events):
     ics = [
@@ -167,11 +179,12 @@ def create_ics_file(events):
             e = evt['end'].replace(':', '') + "00"
             
             summary = evt.get('summary', 'Cours')
+            bg_color = evt.get('background_color', '').upper()
             
-            # Gestion Priorité Examen
+            # Gestion EXAMEN (Si Jaune ou mention explicite)
             priority = "5"
-            if "EXAMEN" in summary.upper():
-                summary = "🔴 " + summary
+            if "JAUNE" in bg_color or "EXAMEN" in summary.upper():
+                summary = "🔴 [EXAMEN] " + summary.replace("[EXAMEN] ", "")
                 priority = "1"
 
             ics.append("BEGIN:VEVENT")
@@ -192,23 +205,17 @@ def main():
     print("Téléchargement PDF...")
     response = requests.get(PDF_URL)
     
-    # 400 DPI : Haute résolution pour bien voir la séparation des lignes
-    print("Conversion PDF -> Images (400 DPI)...")
-    images = convert_from_bytes(response.content, dpi=400) 
+    # 300 DPI est suffisant si on ne fait pas de pixel-art
+    print("Conversion PDF -> Images (300 DPI)...")
+    images = convert_from_bytes(response.content, dpi=300) 
 
     all_events = []
     print(f"Traitement de {len(images)} pages...")
     for i, img in enumerate(images):
         print(f"--- Analyse Page {i+1} ---")
-        raw_events = get_schedule_robust(img)
-        
-        # Filtrage Python strict
-        valid_events = filter_events_python(raw_events)
-        
-        if valid_events:
-            all_events.extend(valid_events)
-        else:
-            print("❌ Aucun cours valide trouvé sur cette page.")
+        raw = get_schedule_robust(img)
+        filtered = filter_events_strict(raw)
+        all_events.extend(filtered)
 
     print("Génération ICS...")
     ics_content = create_ics_file(all_events)
