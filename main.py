@@ -25,7 +25,6 @@ RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Th
 """
 
 def get_available_models():
-    """Récupère les modèles dispos."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
     try:
         response = requests.get(url)
@@ -43,20 +42,19 @@ def clean_json_text(text):
 
 def preprocess_destructive(pil_image):
     """
-    Transforme l'ORANGE en NOIR pour effacer le texte 'Sport'.
+    Transforme l'ORANGE en NOIR pour masquer le texte 'Sport' ou les cours annulés.
     """
     img_array = np.array(pil_image)
     
-    # ORANGE (#FFB84D) ~ [255, 184, 77]
-    # Tolérance élargie pour être sûr de tout attraper
-    # Rouge Haut, Bleu Bas, Vert Moyen (c'est la signature de l'orange)
+    # Détection ORANGE (#FFB84D)
+    # R > 180, G entre 100 et 210, B < 160
     red_cond = img_array[:, :, 0] > 180
     green_cond = (img_array[:, :, 1] > 100) & (img_array[:, :, 1] < 210)
     blue_cond = img_array[:, :, 2] < 160
     
     mask_orange = red_cond & green_cond & blue_cond
     
-    # Remplacement par NOIR (0,0,0) -> Le texte noir devient invisible
+    # Remplacement par NOIR (0,0,0)
     img_array[mask_orange] = [0, 0, 0]
     
     return Image.fromarray(img_array)
@@ -80,51 +78,25 @@ def call_gemini(image, model_name, prompt):
     }
     return requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
 
-def detect_week_date_from_image(image, model_list):
-    """Demande à l'IA de lire la date écrite en haut à gauche (ex: 12/janv)."""
-    # On crop le coin haut gauche pour aider l'IA
-    w, h = image.size
-    header_crop = image.crop((0, 0, int(w*0.3), int(h*0.3)))
-    
-    prompt = """
-    Regarde cette image. Quelle est la date écrite sous le numéro de semaine (ex: '12/janv' ou '19/janv') ?
-    Format attendu JSON : {"date_str": "JJ/Mois"}
-    Si tu ne trouves pas, renvoie null.
-    """
-    
-    for model in model_list:
-        try:
-            resp = call_gemini(header_crop, model, prompt)
-            if resp.status_code == 200:
-                data = json.loads(clean_json_text(resp.json()['candidates'][0]['content']['parts'][0]['text']))
-                if data.get('date_str'):
-                    return data['date_str']
-        except: continue
-    return None
-
-def parse_date_string(date_str):
-    """Convertit '12/janv' en '2026-01-12'."""
-    try:
-        # Nettoyage
-        clean = date_str.lower().replace("janv", "01").replace("févr", "02").replace("mars", "03").strip()
-        clean = re.sub(r"[^0-9/]", "", clean) # Garde chiffres et slash
-        
-        day, month = clean.split('/')
-        return f"2026-{month.zfill(2)}-{day.zfill(2)}"
-    except:
-        return None
-
-def extract_schedule(image, model_list, week_start_date):
-    """Extrait l'emploi du temps complet de la page."""
+def extract_all_weeks(image, model_list):
+    """Extrait TOUTES les semaines présentes sur la page."""
     
     prompt = f"""
-    Analyse cet emploi du temps pour la semaine du {week_start_date}.
+    Analyse cette image qui contient PLUSIEURS semaines d'emploi du temps empilées verticalement.
     GROUPE CIBLE : "GB" (Groupe B).
+    ANNÉE : 2026.
 
-    RÈGLES DE FILTRAGE STRICTES :
-    1. **IGNORER** tous les cours marqués "/GA", "/GC" ou "Groupe A/C".
-    2. **IGNORER** les cours de "Sport" (souvent sur fond orange, qui apparait noir/bizarre ici).
-    3. **POSITION** : Si une case contient deux lignes de texte (Haut/Bas), celle du HAUT est pour GA (Ignore), celle du BAS est pour GB (Garde).
+    TACHE : Repère chaque bloc semaine (identifié par une date à gauche, ex: "12/janv", "19/janv", "26/janv", "02/févr").
+    Pour CHAQUE semaine trouvée, extrais les cours du groupe GB.
+
+    RÈGLES DE FILTRAGE :
+    1. **POSITION (HAUT/BAS)** : Dans une case avec deux matières superposées :
+       - Celle du HAUT est pour le Groupe A (GA/GC) -> **IGNORE-LA**.
+       - Celle du BAS est pour le Groupe B (GB) -> **GARDE-LA**.
+       - Texte centré -> GARDE.
+    2. **COULEUR** :
+       - Zones NOIRES (anciennement orange) -> **IGNORE** (Cours annulés/Sport).
+       - Zones JAUNES -> **EXAMEN** (mets "is_exam": true).
     
     RÈGLES HORAIRES :
     - Col 1: 07h45-09h45
@@ -135,25 +107,27 @@ def extract_schedule(image, model_list, week_start_date):
     FORMAT JSON :
     [
       {{
-        "day_index": 0, (0=Lundi, 1=Mardi, 2=Mercredi, 3=Jeudi, 4=Vendredi)
+        "week_label": "12/janv", (La date écrite à gauche de la ligne correspondante)
+        "day": "Lundi", (ou Mardi, Mercredi...)
         "summary": "Matière (Prof)",
         "start_time": "HH:MM",
         "end_time": "HH:MM",
         "location": "Salle",
-        "raw_text": "Texte complet lu pour vérification"
+        "is_exam": true/false
       }}
     ]
     Profs: {PROFS_DICT}
     """
     
     for model in model_list:
-        print(f"   👉 Tentative lecture avec {model}...")
+        print(f"   👉 Tentative lecture globale avec {model}...")
         try:
             resp = call_gemini(image, model, prompt)
             if resp.status_code == 200:
                 raw = resp.json()
-                if 'candidates' in raw:
-                    return json.loads(clean_json_text(raw['candidates'][0]['content']['parts'][0]['text']))
+                if 'candidates' in raw and raw['candidates']:
+                    txt = clean_json_text(raw['candidates'][0]['content']['parts'][0]['text'])
+                    return json.loads(txt)
             elif resp.status_code in [429, 503]:
                 print(f"      ⚠️ Surcharge ({resp.status_code}). Suivant...")
                 continue
@@ -161,6 +135,30 @@ def extract_schedule(image, model_list, week_start_date):
             print(f"      ❌ Erreur: {e}")
             continue
     return []
+
+def calculate_date(week_label, day_name):
+    """Calcule la date précise : 2026 + mois/jour du label + jour de la semaine."""
+    try:
+        # Nettoyage label semaine (ex: "12/janv" -> "12/01")
+        lbl = week_label.lower().replace("janv", "01").replace("févr", "02").replace("mars", "03").replace("avr", "04")
+        lbl = re.sub(r"[^0-9/]", "", lbl)
+        
+        # On suppose année 2026
+        day_str, month_str = lbl.split('/')
+        week_start = datetime(2026, int(month_str), int(day_str))
+        
+        # Offset jour
+        days = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"]
+        day_offset = 0
+        for i, d in enumerate(days):
+            if d.lower() in day_name.lower():
+                day_offset = i
+                break
+                
+        final_date = week_start + timedelta(days=day_offset)
+        return final_date.strftime("%Y%m%d")
+    except:
+        return None
 
 def create_ics(events):
     ics = [
@@ -172,16 +170,26 @@ def create_ics(events):
     ]
     
     for evt in events:
-        d = evt['date'].replace('-', '')
+        # Calcul date
+        d = calculate_date(evt.get('week_label', '01/01'), evt.get('day', 'Lundi'))
+        if not d: continue
+        
         s = evt['start_time'].replace(':', '') + "00"
         e = evt['end_time'].replace(':', '') + "00"
         
-        summary = evt['summary']
+        summary = evt.get('summary', 'Cours')
         prio = "5"
-        if "EXAMEN" in summary.upper():
-            summary = "🔴 " + summary
+        
+        # Gestion Examen
+        if evt.get('is_exam') or "EXAMEN" in summary.upper():
+            if "🔴" not in summary:
+                summary = "🔴 [EXAMEN] " + summary.replace("[EXAMEN]", "").strip()
             prio = "1"
             
+        # Filtrage ultime (sécurité)
+        if "SPORT" in summary.upper() and prio != "1": continue
+        if "/GA" in summary.upper() or "/GC" in summary.upper(): continue
+
         ics.append("BEGIN:VEVENT")
         ics.append(f"DTSTART:{d}T{s}")
         ics.append(f"DTEND:{d}T{e}")
@@ -197,27 +205,13 @@ def create_ics(events):
 def main():
     if not API_KEY: raise Exception("Clé API manquante")
 
-    # 1. Modèles
     avail = get_available_models()
-    # Votre liste de priorité
+    # Liste fournie par l'utilisateur
     prio = [
-        # --- GÉNÉRATION 3 ---
-        "gemini-3-pro-preview",
-        "gemini-3-flash-preview",
-        # --- GÉNÉRATION 2.5 ---
-        "gemini-2.5-pro",
-        "gemini-2.5-flash",
-        # --- GÉNÉRATION 2.0 ---
-        "gemini-2.0-flash-001",
-        # --- LITE ---
-        "gemini-2.5-flash-lite",
-        "gemini-2.0-flash-lite-preview-02-05",
-        # --- GÉNÉRATION 1.5 ---
-        "gemini-1.5-pro-latest",
-        "gemini-1.5-pro",
-        "gemini-1.5-flash-latest",
-        "gemini-1.5-flash",
-        "gemini-1.5-flash-8b"
+        "gemini-3-pro-preview", "gemini-3-flash-preview",
+        "gemini-2.5-pro", "gemini-2.5-flash",
+        "gemini-2.0-flash-001", "gemini-2.5-flash-lite", "gemini-2.0-flash-lite-preview-02-05",
+        "gemini-1.5-pro-latest", "gemini-1.5-pro", "gemini-1.5-flash-latest", "gemini-1.5-flash", "gemini-1.5-flash-8b"
     ]
     models = [m for m in prio if m in avail]
     if not models: models = ["gemini-1.5-flash"]
@@ -228,56 +222,29 @@ def main():
     response = requests.get(PDF_URL)
     images = convert_from_bytes(response.content, dpi=300) 
 
-    final_events = []
+    all_events = []
 
     print(f"Traitement de {len(images)} pages...")
     for i, img in enumerate(images):
         print(f"--- Page {i+1} ---")
         
-        # A. Nettoyage Visuel (Destructif pour Sport)
+        # 1. Nettoyage Visuel (Masquage Orange en Noir)
         clean_img = preprocess_destructive(img)
         
-        # B. Détection de la date réelle (Anti-Mélange)
-        date_str = detect_week_date_from_image(img, models)
-        week_start = parse_date_string(date_str)
+        # 2. Extraction Multi-Semaines
+        page_events = extract_all_weeks(clean_img, models)
         
-        # Fallback si date non lue (ex: page 1 = 12 janv par défaut)
-        if not week_start:
-            print("      ⚠️ Date non détectée, estimation...")
-            # Estimation: 12 Janvier + 7 jours * page index
-            start_dt = datetime(2026, 1, 12) + timedelta(days=i*7)
-            week_start = start_dt.strftime("%Y-%m-%d")
+        if page_events:
+            print(f"   ✅ {len(page_events)} cours trouvés sur cette page.")
+            all_events.extend(page_events)
+        else:
+            print("   ❌ Aucun cours extrait.")
             
-        print(f"   📅 Semaine détectée : {week_start}")
-        
-        # C. Extraction des cours
-        raw_events = extract_schedule(clean_img, models, week_start)
-        
-        # D. Filtrage Python (Anti-Sport / Anti-GA)
-        week_dt = datetime.strptime(week_start, "%Y-%m-%d")
-        
-        for evt in raw_events:
-            summary = evt.get('summary', '').upper()
-            raw_txt = evt.get('raw_text', '').upper()
-            
-            # FILTRES DURS
-            if "SPORT" in summary and "EXAMEN" not in summary: continue
-            if "/GA" in raw_txt or "/GC" in raw_txt or "(GA)" in summary or "(GC)" in summary: continue
-            if "GROUPE A" in raw_txt: continue
-
-            # Calcul date exacte
-            day_idx = evt.get('day_index', 0)
-            real_date = (week_dt + timedelta(days=day_idx)).strftime("%Y-%m-%d")
-            
-            evt['date'] = real_date
-            final_events.append(evt)
-            
-        print(f"   ✅ {len(raw_events)} cours extraits -> {len(final_events)} après filtrage.")
         time.sleep(2)
 
     print("Génération ICS...")
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        f.write(create_ics(final_events))
+        f.write(create_ics(all_events))
     print("Terminé.")
 
 if __name__ == "__main__":
