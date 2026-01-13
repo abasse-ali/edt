@@ -14,6 +14,7 @@ PDF_URL = "https://stri.fr/Gestion_STRI/TAV/L3/EDT_STRI1A_L3IRT_TAV.pdf"
 OUTPUT_FILE = "emploi_du_temps.ics"
 API_KEY = os.environ.get("GEMINI_API_KEY")
 
+# Mapping profs
 PROFS_DICT = """
 AnAn=Andréi ANDRÉI; AA=André AOUN; AB=Abdelmalek BENZEKRI; AL=Abir LARABA; BC=Bilal CHEBARO; 
 BTJ=Boris TIOMELA JOU; CC=Cédric CHAMBAULT; CG=Christine GALY; CT=Cédric TEYSSIE; EG=Eric GONNEAU; 
@@ -24,7 +25,7 @@ RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Th
 """
 
 def get_available_models():
-    """Récupère la liste réelle des modèles activés pour votre clé."""
+    """Récupère les modèles dispos."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
     try:
         response = requests.get(url)
@@ -40,24 +41,52 @@ def clean_json_text(text):
         return text[start:end+1]
     return text
 
-def preprocess_image(pil_image):
+def preprocess_and_clean_image(pil_image):
     """
-    Efface chirurgicalement l'orange (info inutile) sans toucher au jaune (examen).
+    1. Efface le Orange (Sport/Annulé).
+    2. Retourne l'image nettoyée.
     """
-    print("   🎨 Nettoyage des couleurs...")
     img_array = np.array(pil_image)
-
-    # Détection de l'orange : Rouge élevé, Bleu faible, Vert "moyen" (l'orange est ~180, le jaune ~220)
+    
+    # Détection ORANGE élargie (Sport est souvent vif)
+    # R > 200, G entre 100 et 210, B < 100
     red_cond = img_array[:, :, 0] > 200
-    blue_cond = img_array[:, :, 2] < 180
-    green_orange_cond = (img_array[:, :, 1] > 130) & (img_array[:, :, 1] < 205)
-
-    mask_orange = red_cond & blue_cond & green_orange_cond
-    img_array[mask_orange] = [255, 255, 255] # On remplace par du blanc
-
+    green_cond = (img_array[:, :, 1] > 100) & (img_array[:, :, 1] < 210)
+    blue_cond = img_array[:, :, 2] < 150
+    
+    mask_orange = red_cond & green_cond & blue_cond
+    
+    # On remplace l'orange par du blanc
+    img_array[mask_orange] = [255, 255, 255]
+    
     return Image.fromarray(img_array)
 
-def call_gemini_api(image, model_name):
+def slice_image_into_days(pil_image):
+    """
+    Découpe l'image en bandes horizontales (une par jour).
+    C'est une heuristique : on divise la hauteur par 5 (Lundi-Vendredi).
+    Ce n'est pas parfait au pixel près mais ça aide l'IA à focus.
+    """
+    width, height = pil_image.size
+    # On ignore l'en-tête (les premiers 10%)
+    header_offset = int(height * 0.10)
+    content_height = height - header_offset
+    
+    day_height = content_height / 5 # 5 jours ouvrés
+    
+    slices = []
+    days = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"]
+    
+    for i in range(5):
+        top = header_offset + (i * day_height)
+        bottom = top + day_height
+        # On ajoute une petite marge de sécurité pour ne pas couper le texte
+        box = (0, int(top), width, int(bottom))
+        slices.append((days[i], pil_image.crop(box)))
+        
+    return slices
+
+def call_gemini_api(image, model_name, day_hint):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={API_KEY}"
     
     img_byte_arr = io.BytesIO()
@@ -65,35 +94,36 @@ def call_gemini_api(image, model_name):
     b64_data = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
 
     prompt = f"""
-    Analyse cette image d'emploi du temps (nettoyée).
+    Analyse cette portion d'emploi du temps correspondant au jour : {day_hint}.
+    GROUPE CIBLE : GB (Groupe B).
     ANNÉE : 2026.
 
-    OBJECTIF : Lister TOUS les cours visibles, sans filtrer. Je filtrerai moi-même ensuite.
+    RÈGLES VISUELLES CRITIQUES :
+    1. **HAUT vs BAS** : Dans chaque colonne (créneau horaire), il peut y avoir deux matières l'une sur l'autre.
+       - La matière du HAUT est pour le Groupe A (GA/GC) -> **IGNORE-LA**.
+       - La matière du BAS est pour le Groupe B (GB) -> **GARDE-LA**.
+       - Si le texte est centré (une seule matière), garde-le.
+    
+    2. **COULEUR** : Les cases ORANGES ont été effacées (blanches). Les cases JAUNES sont des EXAMENS.
+    
+    3. **HORAIRES** :
+       L'image représente une seule ligne (un seul jour) de gauche à droite.
+       - Créneau 1 (Gauche) : 07h45 - 09h45
+       - Créneau 2 : 10h00 - 12h00
+       - Créneau 3 : 13h30 - 15h30
+       - Créneau 4 (Droite) : 15h45 - 17h45
 
-    POUR CHAQUE COURS, DÉTECTE CES 3 ATTRIBUTS :
-    1. **background** : "JAUNE" (si fond jaune vif), "BLANC" (sinon). (L'orange a été effacé).
-    2. **position** : "HAUT" (si demi-ligne supérieure), "BAS" (si demi-ligne inférieure), "UNIQUE" (si ligne entière).
-    3. **text** : Le texte complet (Matière, Prof, Groupe ex: /GC, /GA, /GB).
-
-    RÈGLES HORAIRES :
-    - Col 1 : 07h45 - 09h45
-    - Col 2 : 10h00 - 12h00
-    - Col 3 : 13h30 - 15h30 (Début 13h30 strict)
-    - Col 4 : 15h45 - 17h45
-
-    FORMAT JSON STRICT :
+    FORMAT JSON LIST :
     [
-      {{
-        "date": "2026-MM-JJ",
-        "summary": "Matière (Prof)",
-        "start": "HH:MM",
-        "end": "HH:MM",
+      {{ 
+        "summary": "Matière (Prof)", 
+        "start": "HH:MM", 
+        "end": "HH:MM", 
         "location": "Salle",
-        "background": "JAUNE/BLANC",
-        "position": "HAUT/BAS/UNIQUE",
-        "raw_text": "Texte complet lu"
+        "is_exam": true/false
       }}
     ]
+    Si aucun cours n'est pertinent pour le groupe GB, renvoie une liste vide [].
     Profs: {PROFS_DICT}
     """
 
@@ -110,105 +140,50 @@ def call_gemini_api(image, model_name):
 
     return requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
 
-def get_schedule_robust(image):
-    # 1. On récupère TOUS les modèles disponibles
-    available_in_account = get_available_models()
-    
-    # 2. LISTE COMPLÈTE DE PRIORITÉ (Du plus intelligent au plus rapide)
+def get_schedule_robust(image, day_name):
+    # Liste complète de modèles pour éviter l'échec
+    available = get_available_models()
     priority_list = [
-        # Les modèles "Pro" (Meilleure vision)
-        "gemini-2.5-pro",
-        "gemini-1.5-pro",
-        "gemini-1.5-pro-latest",
-        "gemini-1.5-pro-001",
-        
-        # Les modèles "Flash" récents (Rapides)
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-2.0-flash-001",
-        "gemini-2.0-flash-lite-preview-02-05",
-        
-        # Les "Classiques" (Très fiables en quota)
-        "gemini-1.5-flash",
-        "gemini-flash-latest",
-        "gemini-1.5-flash-latest",
-        "gemini-1.5-flash-001"
+        "gemini-1.5-pro", "gemini-1.5-pro-latest", # Les meilleurs pour le détail HAUT/BAS
+        "gemini-2.0-flash", "gemini-flash-latest",
+        "gemini-1.5-flash"
     ]
+    models = [m for m in priority_list if m in available]
+    if not models: models = ["gemini-1.5-flash"]
 
-    # On croise les deux listes pour ne tester que ce qui existe
-    models_to_try = [m for m in priority_list if m in available_in_account]
-    
-    # Si la liste est vide (bug API), on force les classiques
-    if not models_to_try:
-        models_to_try = ["gemini-1.5-flash", "gemini-flash-latest"]
-
-    print(f"   📋 {len(models_to_try)} modèles prêts à être testés : {models_to_try}")
-
-    # Prétraitement unique
-    cleaned_img = preprocess_image(image)
-
-    # BOUCLE DE FAILOVER
-    for model in models_to_try:
-        print(f"   👉 Tentative avec : {model}...")
+    for model in models:
         try:
-            response = call_gemini_api(cleaned_img, model)
-
+            # print(f"   👉 {day_name} avec {model}...")
+            response = call_gemini_api(image, model, day_name)
             if response.status_code == 200:
-                raw_resp = response.json()
-                if 'candidates' in raw_resp and raw_resp['candidates']:
-                    clean = clean_json_text(raw_resp['candidates'][0]['content']['parts'][0]['text'])
+                raw = response.json()
+                if 'candidates' in raw and raw['candidates']:
+                    clean = clean_json_text(raw['candidates'][0]['content']['parts'][0]['text'])
                     return json.loads(clean)
-                else:
-                    print("      ⚠️ Réponse vide (IA muette). Suivant...")
-                    continue
-            
             elif response.status_code in [429, 503]:
-                print(f"      ⚠️ Bloqué ({response.status_code}). Suivant immédiat...")
-                continue # On passe direct au modèle suivant
-            else:
-                print(f"      ❌ Erreur {response.status_code}. Suivant...")
-                continue
-
-        except Exception as e:
-            print(f"      ❌ Exception : {e}. Suivant...")
+                continue # On passe au modèle suivant en silence
+        except:
             continue
-
-    print("❌ ECHEC TOTAL : Aucun modèle n'a fonctionné.")
     return []
 
-def filter_events_strict(events):
-    valid_events = []
-    print(f"   🧹 Filtrage de {len(events)} événements bruts...")
+def calculate_date(week_start_date, day_name):
+    # Fonction simple pour mapper Lundi->Date
+    # On suppose que la page commence le 12 Janvier 2026 d'après vos logs précédents
+    # (A adapter si vous voulez que ça détecte la date auto, mais fixons 2026)
+    base_date = "2026-01-12" # Lundi de la première page visible
+    days = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"]
     
-    for evt in events:
-        summary = evt.get('summary', '').upper()
-        raw_text = evt.get('raw_text', '').upper()
-        bg_color = evt.get('background', 'BLANC').upper()
-        position = evt.get('position', 'UNIQUE').upper()
+    try:
+        delta = days.index(day_name)
+        # Calcul basique, pour un vrai système il faut lire la date sur l'image
+        # Ici on simplifie pour l'exemple
+        from datetime import datetime, timedelta
+        dt = datetime.strptime(base_date, "%Y-%m-%d") + timedelta(days=delta)
+        return dt.strftime("%Y-%m-%d")
+    except:
+        return "2026-01-01"
 
-        # RÈGLE 1 : Couleur ORANGE = POUBELLE
-        # (Normalement déjà effacé par le script, mais double sécurité)
-        if "ORANGE" in bg_color:
-            continue
-            
-        # RÈGLE 2 : Groupe Explicitement Interdit dans le texte
-        if "/GA" in raw_text or "/GC" in raw_text or "(GA)" in summary or "(GC)" in summary:
-            print(f"      🗑️ Rejet (Groupe GA/GC) : {summary}")
-            continue
-
-        # RÈGLE 3 : Position HAUT = POUBELLE (sauf si explicitement marqué GB)
-        # Si c'est en haut et qu'il n'y a PAS marqué "GB", on jette.
-        if position == "HAUT":
-            if "/GB" not in raw_text and "GB" not in summary:
-                print(f"      🗑️ Rejet (Position Haut sans GB) : {summary}")
-                continue
-
-        valid_events.append(evt)
-
-    print(f"   ✅ {len(valid_events)} événements conservés.")
-    return valid_events
-
-def create_ics_file(events):
+def create_ics_file(all_events):
     ics = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
@@ -216,30 +191,33 @@ def create_ics_file(events):
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH"
     ]
-    for evt in events:
-        try:
-            d = evt['date'].replace('-', '')
-            if d.startswith("2025"): d = d.replace("2025", "2026", 1)
-            s = evt['start'].replace(':', '') + "00"
-            e = evt['end'].replace(':', '') + "00"
-            
-            summary = evt.get('summary', 'Cours')
-            bg_color = evt.get('background', '').upper()
-            
-            priority = "5"
-            if "JAUNE" in bg_color or "EXAMEN" in summary.upper():
-                summary = "🔴 [EXAMEN] " + summary.replace("[EXAMEN] ", "")
-                priority = "1"
+    for date, events in all_events.items():
+        for evt in events:
+            try:
+                # Filtrage ultime
+                summary = evt.get('summary', '').upper()
+                if "SPORT" in summary and "EXAMEN" not in summary: continue # Sécurité Sport
+                
+                d = date.replace('-', '')
+                s = evt['start'].replace(':', '') + "00"
+                e = evt['end'].replace(':', '') + "00"
+                
+                final_summary = evt.get('summary', 'Cours')
+                priority = "5"
+                if evt.get('is_exam') or "EXAMEN" in final_summary.upper():
+                    if "EXAMEN" not in final_summary.upper():
+                        final_summary = "🔴 [EXAMEN] " + final_summary
+                    priority = "1"
 
-            ics.append("BEGIN:VEVENT")
-            ics.append(f"DTSTART:{d}T{s}")
-            ics.append(f"DTEND:{d}T{e}")
-            ics.append(f"SUMMARY:{summary}")
-            ics.append(f"LOCATION:{evt.get('location', '')}")
-            ics.append(f"PRIORITY:{priority}")
-            ics.append("DESCRIPTION:Groupe GB")
-            ics.append("END:VEVENT")
-        except: continue
+                ics.append("BEGIN:VEVENT")
+                ics.append(f"DTSTART:{d}T{s}")
+                ics.append(f"DTEND:{d}T{e}")
+                ics.append(f"SUMMARY:{final_summary}")
+                ics.append(f"LOCATION:{evt.get('location', '')}")
+                ics.append(f"PRIORITY:{priority}")
+                ics.append("DESCRIPTION:Groupe GB")
+                ics.append("END:VEVENT")
+            except: continue
     ics.append("END:VCALENDAR")
     return "\n".join(ics)
 
@@ -252,16 +230,44 @@ def main():
     print("Conversion PDF -> Images (300 DPI)...")
     images = convert_from_bytes(response.content, dpi=300) 
 
-    all_events = []
+    final_calendar_data = {}
+
+    # DATE DE DÉBUT (À ajuster chaque semaine ou lire sur l'image)
+    # Pour ce test on fixe au 12 Janvier 2026 comme vu sur l'EDT
+    from datetime import datetime, timedelta
+    current_monday = datetime(2026, 1, 12) 
+
     print(f"Traitement de {len(images)} pages...")
     for i, img in enumerate(images):
-        print(f"--- Analyse Page {i+1} ---")
-        raw = get_schedule_robust(img)
-        filtered = filter_events_strict(raw)
-        all_events.extend(filtered)
+        print(f"--- Page {i+1} ---")
+        
+        # 1. Nettoyage Couleur
+        clean_img = preprocess_and_clean_image(img)
+        
+        # 2. Découpage par jour
+        day_slices = slice_image_into_days(clean_img)
+        
+        for day_name, day_img in day_slices:
+            print(f"   📅 Analyse {day_name}...")
+            
+            # Calcul de la date réelle
+            day_offset = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"].index(day_name)
+            real_date = (current_monday + timedelta(days=day_offset + (i*7))).strftime("%Y-%m-%d")
+            
+            # Appel API sur la BANDE du jour uniquement
+            events = get_schedule_robust(day_img, day_name)
+            
+            if events:
+                print(f"      ✅ {len(events)} cours.")
+                final_calendar_data[real_date] = events
+            else:
+                print("      ❌ Aucun cours ou erreur.")
+        
+        # Pause pour quota
+        time.sleep(2)
 
     print("Génération ICS...")
-    ics_content = create_ics_file(all_events)
+    ics_content = create_ics_file(final_calendar_data)
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         f.write(ics_content)
