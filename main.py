@@ -22,7 +22,7 @@ RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Th
 """
 
 def get_best_model_name():
-    """Cherche le modèle le plus intelligent (Pro) disponible."""
+    """Sélectionne le meilleur modèle disponible (2.0/2.5 > Pro > Flash)."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
     try:
         response = requests.get(url)
@@ -30,34 +30,36 @@ def get_best_model_name():
             return "gemini-1.5-flash"
 
         data = response.json()
-        available_models = [m['name'].replace('models/', '') for m in data.get('models', [])]
-        print(f"📋 Modèles disponibles : {available_models}")
+        available = [m['name'].replace('models/', '') for m in data.get('models', [])]
+        print(f"📋 Modèles dispo : {available}")
 
-        # On veut le PRO pour la géométrie complexe
+        # ORDRE DE PRIORITÉ BASÉ SUR VOS LOGS
         preferences = [
-            "gemini-1.5-pro",
+            "gemini-2.0-flash",       # Excellent compromis vitesse/intelligence
+            "gemini-2.5-flash",       # Nouvelle génération
+            "gemini-1.5-pro",         # Très intelligent
             "gemini-1.5-pro-latest",
-            "gemini-1.5-pro-001",
-            "gemini-pro",
-            "gemini-flash-latest" # Repli
+            "gemini-flash-latest"     # Fallback
         ]
 
         for pref in preferences:
-            if pref in available_models:
-                print(f"✅ Modèle SÉLECTIONNÉ : {pref}")
+            if pref in available:
+                print(f"✅ Modèle CHOISI : {pref}")
                 return pref
-                
+        
         return "gemini-1.5-flash"
 
     except Exception:
         return "gemini-1.5-flash"
 
 def clean_json_text(text):
-    text = re.sub(r"```json|```", "", text).strip()
-    start = text.find('{')
-    end = text.rfind('}')
+    # On cherche le premier '[' et le dernier ']'
+    start = text.find('[')
+    end = text.rfind(']')
     if start != -1 and end != -1:
         return text[start:end+1]
+    # Si échec, on tente de nettoyer le markdown
+    text = re.sub(r"```json|```", "", text).strip()
     return text
 
 def call_gemini_api(image, model_name):
@@ -67,41 +69,31 @@ def call_gemini_api(image, model_name):
     image.save(img_byte_arr, format='JPEG')
     b64_data = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
 
-    # PROMPT MIS À JOUR (13h30 + Ligne Basse)
     prompt = f"""
-    Tu es un expert en extraction d'emploi du temps complexe.
-    CIBLE : Groupe "GB".
-    ANNÉE : 2026.
+    Analyse l'emploi du temps pour le groupe "GB".
+    ANNÉE : 2026 (Force cette année).
 
-    RÈGLES DE LECTURE GÉOMÉTRIQUE (TRES IMPORTANT) :
-    
-    1. **DIVISION HORIZONTALE (HAUT / BAS)** :
-       Regarde la ligne de chaque jour. Souvent, elle est coupée en deux sous-lignes horizontales.
-       - La sous-ligne du **HAUT** concerne le Groupe 1 (G1/GA). -> **IGNORE TOUT CE QUI EST EN HAUT**.
-       - La sous-ligne du **BAS** concerne le Groupe 2 (GB). -> **LIS UNIQUEMENT LA LIGNE DU BAS**.
-       - Si la ligne n'est pas coupée, c'est un cours commun : garde-le.
+    RÈGLES VISUELLES :
+    1. **LIGNES COUPÉES** : Si une ligne de jour est divisée en deux (Haut/Bas) :
+       - HAUT = Groupe GA/G1 -> IGNORE.
+       - BAS = Groupe GB/G2 -> LIS CE COURS.
+    2. **FILTRE COULEUR** : IGNORE les cases ORANGES/JAUNES (Examens/Admin). Lis les blanches.
+    3. **FILTRE GROUPE** : Garde uniquement "/GB" ou sans groupe. Ignore "/GC".
+    4. **HORAIRES** :
+       - Matin : 07h45-09h45 et 10h00-12h00.
+       - Après-midi : **13h30**-15h30 et 15h45-17h45.
+       (Attention : l'après-midi commence souvent à la 2ème graduation après 13h).
 
-    2. **FILTRE GROUPE** :
-       - Garde uniquement "/GB" ou les cours sans mention de groupe.
-       - Si tu vois "/GC", ignore.
-       - Si tu vois "/GA", ignore.
-
-    3. **FILTRE COULEUR** :
-       - Si le fond de la case est ORANGE/JAUNE -> IGNORE (ce sont des examens ou infos admin).
-       - Lis uniquement les cases à fond BLANC.
-
-    4. **HORAIRES PRÉCIS** :
-       - Colonne 1 : 07h45 - 09h45
-       - Colonne 2 : 10h00 - 12h00
-       - Colonne 3 : **13h30** - 15h30 (Attention : commence à la 2ème graduation après 13h)
-       - Colonne 4 : 15h45 - 17h45
-
-    FORMAT DE SORTIE (JSON par Jour) :
-    {{
-      "2026-01-12": [
-         {{ "summary": "Matière (Prof)", "start": "13:30", "end": "15:30", "location": "Salle" }}
-      ]
-    }}
+    FORMAT DE SORTIE : Une LISTE JSON unique contenant tous les cours de la page.
+    [
+      {{
+        "date": "2026-MM-JJ",
+        "summary": "Matière (Prof)",
+        "start": "HH:MM",
+        "end": "HH:MM",
+        "location": "Salle"
+      }}
+    ]
     Remplace les profs par : {PROFS_DICT}
     """
 
@@ -121,6 +113,7 @@ def call_gemini_api(image, model_name):
 def get_schedule_robust(image):
     model_name = get_best_model_name()
     
+    # 3 Tentatives en cas de crash
     for attempt in range(3):
         try:
             print(f"   👉 Tentative {attempt+1} avec {model_name}...")
@@ -129,6 +122,7 @@ def get_schedule_robust(image):
             if response.status_code == 200:
                 raw_resp = response.json()
                 if 'candidates' in raw_resp and raw_resp['candidates']:
+                    # Nettoyage robuste pour éviter l'erreur "Extra data"
                     clean = clean_json_text(raw_resp['candidates'][0]['content']['parts'][0]['text'])
                     return json.loads(clean)
                 else:
@@ -140,16 +134,17 @@ def get_schedule_robust(image):
                 time.sleep(wait)
                 continue
             else:
-                print(f"      ❌ Erreur {response.status_code}. Stop.")
-                return {}
+                print(f"      ❌ Erreur {response.status_code}.")
+                return []
 
         except Exception as e:
-            print(f"      ❌ Exception : {e}")
-            return {}
+            print(f"      ❌ Erreur technique : {e}")
+            # Si erreur JSON, on réessaie peut-être que l'IA fera mieux la prochaine fois
+            continue
             
-    return {}
+    return []
 
-def create_ics_file(grouped_events):
+def create_ics_file(events):
     ics = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
@@ -158,26 +153,24 @@ def create_ics_file(grouped_events):
         "METHOD:PUBLISH"
     ]
     
-    for date_str, courses in grouped_events.items():
-        for evt in courses:
-            try:
-                # Format ICS : YYYYMMDDTHHMMSS
-                d_clean = date_str.replace('-', '')
-                s_clean = evt['start'].replace(':', '') + "00"
-                e_clean = evt['end'].replace(':', '') + "00"
-                
-                # Sécurité 2026
-                if s_clean.startswith("2025"): s_clean = s_clean.replace("2025", "2026", 1)
-                if e_clean.startswith("2025"): e_clean = e_clean.replace("2025", "2026", 1)
+    for evt in events:
+        try:
+            # evt['date'] = "2026-01-12", evt['start'] = "13:30"
+            d_clean = evt['date'].replace('-', '')
+            s_clean = evt['start'].replace(':', '') + "00"
+            e_clean = evt['end'].replace(':', '') + "00"
+            
+            # Sécurité 2026
+            if d_clean.startswith("2025"): d_clean = d_clean.replace("2025", "2026", 1)
 
-                ics.append("BEGIN:VEVENT")
-                ics.append(f"DTSTART:{d_clean}T{s_clean}")
-                ics.append(f"DTEND:{d_clean}T{e_clean}")
-                ics.append(f"SUMMARY:{evt.get('summary', 'Cours')}")
-                ics.append(f"LOCATION:{evt.get('location', '')}")
-                ics.append("DESCRIPTION:Groupe GB")
-                ics.append("END:VEVENT")
-            except: continue
+            ics.append("BEGIN:VEVENT")
+            ics.append(f"DTSTART:{d_clean}T{s_clean}")
+            ics.append(f"DTEND:{d_clean}T{e_clean}")
+            ics.append(f"SUMMARY:{evt.get('summary', 'Cours')}")
+            ics.append(f"LOCATION:{evt.get('location', '')}")
+            ics.append("DESCRIPTION:Groupe GB")
+            ics.append("END:VEVENT")
+        except: continue
                 
     ics.append("END:VCALENDAR")
     return "\n".join(ics)
@@ -188,10 +181,11 @@ def main():
     print("Téléchargement PDF...")
     response = requests.get(PDF_URL)
     
+    # 300 DPI pour la précision
     print("Conversion PDF -> Images (300 DPI)...")
     images = convert_from_bytes(response.content, dpi=300) 
 
-    all_grouped_events = {}
+    all_events = []
 
     print(f"Traitement de {len(images)} pages...")
     for i, img in enumerate(images):
@@ -199,13 +193,13 @@ def main():
         page_events = get_schedule_robust(img)
         
         if page_events:
-            print(f"✅ Jours trouvés : {list(page_events.keys())}")
-            all_grouped_events.update(page_events)
+            print(f"✅ {len(page_events)} cours trouvés.")
+            all_events.extend(page_events)
         else:
             print("❌ Echec lecture page.")
 
     print("Génération ICS...")
-    ics_content = create_ics_file(all_grouped_events)
+    ics_content = create_ics_file(all_events)
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         f.write(ics_content)
