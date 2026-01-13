@@ -22,9 +22,11 @@ RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Th
 """
 
 def clean_json_text(text):
+    # Nettoyage agressif des balises markdown
     text = re.sub(r"```json|```", "", text).strip()
-    start = text.find('[')
-    end = text.rfind(']')
+    # On cherche le premier '{' et le dernier '}' pour attraper l'objet JSON complet
+    start = text.find('{')
+    end = text.rfind('}')
     if start != -1 and end != -1:
         return text[start:end+1]
     return text
@@ -36,46 +38,39 @@ def call_gemini_api(image, model_name):
     image.save(img_byte_arr, format='JPEG')
     b64_data = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
 
-    # --- PROMPT RESTRUCTURÉ POUR ÉVITER LES ERREURS DE JOURS ---
+    # --- PROMPT RESTRUCTURÉ : FORMAT "JOUR PAR JOUR" ---
+    # On demande un dictionnaire par date pour empêcher le mélange des lignes
     prompt = f"""
-    Tu es un robot de lecture d'emploi du temps. Analyse cette image pixel par pixel.
+    Tu es un expert en lecture de grilles complexes.
+    
+    TACHE : Analyse cette image pour le groupe "GB".
+    ANNÉE CIBLE : 2026 (Toutes les dates doivent être en 2026).
 
-    CONTEXTE :
-    - Année : **2026** (Force cette année).
-    - Cible : Groupe **"GB"**.
+    RÈGLES DE LECTURE SPATIALE (TRES IMPORTANT) :
+    1.  **Lecture Ligne par Ligne** : Repère d'abord la DATE dans la colonne de gauche (ex: "Lundi 12/janv").
+    2.  **Verrouillage Horizontal** : Une fois la date trouvée, déplace-toi vers la droite sur CETTE MÊME LIGNE HORIZONTALE. Ne regarde pas au-dessus, ne regarde pas en dessous.
+    3.  **Lignes doubles** : Si le jour a deux lignes, IGNORE la ligne du haut. Lis UNIQUEMENT la ligne du BAS.
+    4.  **Colonnes** :
+        - 1ère col (après la date) : ~07h45 - 09h45
+        - 2ème col : ~10h00 - 12h00
+        - 3ème col : ~13h45 - 15h45
+        - 4ème col : ~15h45 - 17h45
+    5.  **Filtre Groupe** : Garde seulement "/GB" ou sans groupe. Ignore "/GC", "/GA".
+    6.  **Filtre Couleur** : Ignore STRICTEMENT les cases à fond ORANGE/JAUNE.
+    7.  **Profs** : Utilise ce dictionnaire : {PROFS_DICT}
 
-    ALGORITHME DE LECTURE (A SUIVRE STRICTEMENT) :
-    1. **REPÉRAGE DES LIGNES (JOURS)** :
-       - L'image est un tableau. Chaque ligne commence par un Jour (ex: "Lundi 12/janv").
-       - Repère le jour à gauche. TOUS les cours situés à droite sur cette même ligne horizontale appartiennent à CE JOUR précis. Ne mélange pas les lignes.
-       - Si un jour a deux sous-lignes : **IGNORE** la sous-ligne du haut. Lis uniquement celle du BAS.
-
-    2. **FILTRE COULEUR (CRITIQUE)** :
-       - Regarde le fond des cases.
-       - Si le fond est **ORANGE** (ou jaune foncé/grisâtre) : **C'EST INTERDIT**. Jette ce cours immédiatement. Ne l'inclus pas.
-       - Si le fond est BLANC ou clair : C'est OK.
-
-    3. **FILTRE GROUPE** :
-       - Garde uniquement "/GB" ou les cours sans mention de groupe.
-       - Jette "/GC", "/GA".
-
-    4. **HORAIRES** :
-       - Les colonnes représentent les heures.
-       - Les traits verticaux marquent les 15 minutes.
-       - Début journée : 07h45.
-       - Calcule le début et la fin en fonction de la position horizontale de la case.
-
-    5. **PROFS** : {PROFS_DICT}
-
-    SORTIE JSON STRICTE :
-    [
-        {{
-            "summary": "Matière (Prof)",
-            "start": "2026-MM-JJTHH:MM:00",
-            "end": "2026-MM-JJTHH:MM:00",
-            "location": "Salle"
-        }}
-    ]
+    FORMAT DE SORTIE ATTENDU (JSON STRUCTURÉ PAR JOUR) :
+    {{
+      "YYYY-MM-DD": [
+         {{
+           "summary": "Matière (Prof)",
+           "start_time": "HH:MM",  (Heure début format 24h)
+           "end_time": "HH:MM",    (Heure fin format 24h)
+           "location": "Salle"
+         }}
+      ]
+    }}
+    Exemple de clé : "2026-01-12". Ne mets que les jours où il y a cours.
     """
 
     payload = {
@@ -92,17 +87,18 @@ def call_gemini_api(image, model_name):
     return requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
 
 def get_schedule_robust(image):
-    # On garde gemini-1.5-flash en priorité car il respecte mieux les instructions système complexes que les modèles 'lite'
+    # ORDRE DE PRIORITÉ CHANGÉ :
+    # 1. gemini-1.5-pro : C'est le SEUL qui lit correctement les lignes complexes sans mélanger.
+    # 2. gemini-1.5-flash : En secours uniquement.
     models_to_try = [
-        "gemini-1.5-flash",
-        "gemini-flash-latest",
-        "gemini-2.0-flash",
-        "gemini-1.5-pro"
+        "gemini-1.5-pro",
+        "gemini-1.5-pro-latest",
+        "gemini-1.5-flash" 
     ]
 
     for model in models_to_try:
-        print(f"   Tentative avec le modèle : {model}...")
-        for attempt in range(3):
+        print(f"   👉 Analyse avec le modèle : {model}...")
+        for attempt in range(2): # Moins d'essais mais plus ciblés
             try:
                 response = call_gemini_api(image, model)
 
@@ -112,25 +108,25 @@ def get_schedule_robust(image):
                         clean = clean_json_text(raw_resp['candidates'][0]['content']['parts'][0]['text'])
                         return json.loads(clean)
                     else:
-                        print("      Réponse vide.")
+                        print("      ⚠️ Réponse vide.")
                 
                 elif response.status_code in [429, 503]:
-                    wait = (attempt + 1) * 10
-                    print(f"      Surcharge ({response.status_code}). Attente {wait}s...")
-                    time.sleep(wait)
+                    # Le modèle Pro a un quota strict (2 requêtes/min en gratuit).
+                    # On met une pause longue (20s) si on touche la limite.
+                    print(f"      ⚠️ Quota/Surcharge ({response.status_code}). Pause 20s...")
+                    time.sleep(20)
                     continue
                 else:
-                    print(f"      Erreur {response.status_code}. Suivant.")
+                    print(f"      ❌ Erreur {response.status_code}.")
                     break 
 
             except Exception as e:
-                print(f"      Exception : {e}")
+                print(f"      ❌ Exception : {e}")
                 break
         
-    print("ECHEC : Aucun modèle n'a réussi.")
-    return []
+    return {} # Retourne un dict vide en cas d'échec total
 
-def create_ics_file(events):
+def create_ics_file(grouped_events):
     ics = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
@@ -138,23 +134,28 @@ def create_ics_file(events):
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH"
     ]
-    for evt in events:
-        try:
-            s = evt['start'].replace('-', '').replace(':', '')
-            e = evt['end'].replace('-', '').replace(':', '')
-            
-            # Sécurité année 2026
-            if s.startswith("2025"): s = s.replace("2025", "2026", 1)
-            if e.startswith("2025"): e = e.replace("2025", "2026", 1)
+    
+    # On parcourt le dictionnaire par date
+    for date_str, courses in grouped_events.items():
+        for evt in courses:
+            try:
+                # date_str est "YYYY-MM-DD"
+                # evt['start_time'] est "HH:MM"
+                d_clean = date_str.replace('-', '')
+                s_clean = evt['start_time'].replace(':', '') + "00"
+                e_clean = evt['end_time'].replace(':', '') + "00"
 
-            ics.append("BEGIN:VEVENT")
-            ics.append(f"DTSTART:{s}")
-            ics.append(f"DTEND:{e}")
-            ics.append(f"SUMMARY:{evt.get('summary', 'Cours')}")
-            ics.append(f"LOCATION:{evt.get('location', '')}")
-            ics.append("DESCRIPTION:Groupe GB")
-            ics.append("END:VEVENT")
-        except: continue
+                ics.append("BEGIN:VEVENT")
+                ics.append(f"DTSTART:{d_clean}T{s_clean}")
+                ics.append(f"DTEND:{d_clean}T{e_clean}")
+                ics.append(f"SUMMARY:{evt.get('summary', 'Cours')}")
+                ics.append(f"LOCATION:{evt.get('location', '')}")
+                ics.append("DESCRIPTION:Groupe GB")
+                ics.append("END:VEVENT")
+            except Exception as e:
+                print(f"Erreur création événement : {e} pour {evt}")
+                continue
+                
     ics.append("END:VCALENDAR")
     return "\n".join(ics)
 
@@ -164,24 +165,36 @@ def main():
     print("Téléchargement PDF...")
     response = requests.get(PDF_URL)
     
-    # 300 DPI pour bien voir les couleurs (Orange vs Blanc)
     print("Conversion PDF -> Images (300 DPI)...")
     images = convert_from_bytes(response.content, dpi=300) 
 
-    all_events = []
+    all_grouped_events = {}
+
     print(f"Traitement de {len(images)} pages...")
-    
     for i, img in enumerate(images):
-        print(f"--- Analyse Page {i+1} ---")
-        events = get_schedule_robust(img)
-        if events:
-            print(f"{len(events)} cours trouvés.")
-            all_events.extend(events)
+        print(f"--- Analyse Page {i+1} (Cela peut prendre 10-15s pour le modèle Pro) ---")
+        
+        # Appel API
+        page_events = get_schedule_robust(img)
+        
+        if page_events:
+            print(f"✅ Jours trouvés sur cette page : {list(page_events.keys())}")
+            all_grouped_events.update(page_events)
         else:
-            print("Aucun cours trouvé.")
+            print("❌ Echec lecture page.")
+            
+        # PAUSE OBLIGATOIRE POUR LE MODELE PRO (Free Tier)
+        # Le free tier limite à 2 requêtes / minute. 
+        # Si on a plusieurs pages, il faut attendre entre les deux.
+        if i < len(images) - 1:
+            print("⏳ Pause de 30s pour respecter le quota API Pro...")
+            time.sleep(30)
+
+    print("Génération ICS...")
+    ics_content = create_ics_file(all_grouped_events)
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        f.write(create_ics_file(all_events))
+        f.write(ics_content)
     
     print(f"Terminé. Fichier généré : {OUTPUT_FILE}")
 
