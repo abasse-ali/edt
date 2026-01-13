@@ -7,7 +7,7 @@ from datetime import datetime
 PDF_URL = "https://stri.fr/Gestion_STRI/TAV/L3/EDT_STRI1A_L3IRT_TAV.pdf"
 API_KEY = os.environ["GEMINI_API_KEY"]
 
-# Initialisation du client (Nouvelle méthode)
+# Initialisation du client
 client = genai.Client(api_key=API_KEY)
 
 def download_pdf(url, filename="edt.pdf"):
@@ -59,9 +59,9 @@ def generate_ics_content(pdf_path):
     """
 
     # 1. Upload du fichier vers l'API Gemini (File API)
-    # Cette étape est nécessaire pour les fichiers PDF avec la nouvelle librairie
     print("Envoi du fichier à Gemini...")
-    file_upload = client.files.upload(path=pdf_path)
+    # CORRECTION ICI : paramètre 'file' au lieu de 'path'
+    file_upload = client.files.upload(file=pdf_path)
 
     # 2. Génération du contenu
     print("Analyse en cours...")
