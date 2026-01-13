@@ -1,9 +1,9 @@
-name: Update EDT
+name: Update EDT (AI Vision)
 
 on:
   schedule:
-    - cron: '0 5 * * *'
-  workflow_dispatch:
+    - cron: '0 6 * * *' # Tous les jours à 6h
+  workflow_dispatch:      # Permet le lancement manuel
 
 jobs:
   build:
@@ -15,9 +15,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      # ÉTAPE CRUCIALE POUR L'IA (Conversion Image)
+      # --- NOUVEAU : Installation de Poppler pour lire les PDF comme des images ---
       - name: Install Poppler
-        run: sudo apt-get install -y poppler-utils
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -28,9 +28,9 @@ jobs:
         run: |
           pip install -r requirements.txt
 
-      - name: Run parser script
+      - name: Run AI Parser
         env:
-          # On passe la clé API secrète au script ici
+          # On injecte la clé secrète qu'on a mise dans les paramètres GitHub
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python edt_parser.py
 
@@ -39,10 +39,12 @@ jobs:
           git config --global user.name 'GitHub Action'
           git config --global user.email 'action@github.com'
           git add edt.ics
+          
           if git diff --staged --quiet; then
             echo "Pas de changement."
           else
-            git commit -m "Mise à jour EDT via IA"
+            git commit -m "Mise à jour EDT via IA Gemini"
+            # Gestion des conflits automatique
             git pull --rebase -Xtheirs origin main
             git push origin main
           fi
