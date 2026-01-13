@@ -20,8 +20,8 @@ RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Th
 """
 
 def get_gemini_response(image):
-    genai.configure(api_key=API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    # Initialisation du nouveau client
+    client = genai.Client(api_key=API_KEY)
     
     current_year = datetime.now().year
     
@@ -51,7 +51,11 @@ def get_gemini_response(image):
     - Pour chaque événement, inclus : SUMMARY (Matière + Prof), DTSTART, DTEND, LOCATION (Salle), DESCRIPTION (Groupe GB).
     """
 
-    response = model.generate_content([prompt, image])
+    # Nouvelle méthode d'appel
+    response = client.models.generate_content(
+        model="gemini-1.5-flash",
+        contents=[prompt, image]
+    )
     return response.text
 
 def main():
@@ -61,7 +65,6 @@ def main():
         raise Exception("Erreur téléchargement PDF")
 
     print("Conversion du PDF en images...")
-    # Convertit les pages du PDF en images pour que Gemini puisse "voir" les couleurs et positions
     images = convert_from_bytes(response.content)
 
     full_ics_content = "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//STRI//Groupe GB//FR\nCALSCALE:GREGORIAN\n"
@@ -71,7 +74,6 @@ def main():
         print(f"Analyse de la page {i+1} avec Gemini...")
         ics_part = get_gemini_response(img)
         
-        # Nettoyage basique pour fusionner les VEVENT
         lines = ics_part.splitlines()
         for line in lines:
             if line.startswith("BEGIN:VCALENDAR") or line.startswith("END:VCALENDAR") or line.startswith("VERSION:") or line.startswith("PRODID:"):
