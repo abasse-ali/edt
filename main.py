@@ -3,15 +3,16 @@ import io
 import json
 import base64
 import requests
+import re
 from pdf2image import convert_from_bytes
 from datetime import datetime
 
-# Configuration
+# --- CONFIGURATION ---
 PDF_URL = "https://stri.fr/Gestion_STRI/TAV/L3/EDT_STRI1A_L3IRT_TAV.pdf"
 OUTPUT_FILE = "emploi_du_temps.ics"
 API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Dictionnaire profs
+# Mapping des profs
 PROFS_DICT = """
 AnAn=Andréi ANDRÉI; AA=André AOUN; AB=Abdelmalek BENZEKRI; AL=Abir LARABA; BC=Bilal CHEBARO; 
 BTJ=Boris TIOMELA JOU; CC=Cédric CHAMBAULT; CG=Christine GALY; CT=Cédric TEYSSIE; EG=Eric GONNEAU; 
@@ -21,68 +22,66 @@ OM=Olfa MECHI; PA=Patrick AUSTIN; PhA=Philippe ARGUEL; PIL=Pierre LOTTE; PL=Phil
 RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Thierry DESPRATS; TG=Thierry GAYRAUD.
 """
 
-def find_best_model():
-    """Cherche un modèle valide."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
-    try:
-        response = requests.get(url)
-        if response.status_code != 200:
-            return "gemini-1.5-flash"
-        
-        data = response.json()
-        models = [m['name'].replace('models/', '') for m in data.get('models', [])]
-        print(f"ℹ️ Modèles disponibles : {models}")
-        
-        # On préfère le 1.5 Pro pour la lecture de tableaux complexes, sinon Flash
-        preferences = ["gemini-1.5-pro", "gemini-1.5-pro-latest", "gemini-1.5-flash", "gemini-1.5-flash-latest"]
-        
-        for pref in preferences:
-            if pref in models:
-                return pref
-        return "gemini-1.5-flash"
-    except:
-        return "gemini-1.5-flash"
+def clean_json_text(text):
+    """Nettoie le texte pour extraire uniquement le JSON valide."""
+    # On cherche ce qui est entre [ et ]
+    match = re.search(r'\[.*\]', text, re.DOTALL)
+    if match:
+        return match.group(0)
+    # Sinon on essaie de nettoyer les balises markdown
+    text = text.replace("```json", "").replace("```", "").strip()
+    return text
 
-def get_gemini_response(image, model_name):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={API_KEY}"
+def get_schedule_from_gemini(image):
+    # On utilise gemini-1.5-pro car il lit mieux les grilles complexes que flash
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={API_KEY}"
     
     img_byte_arr = io.BytesIO()
     image.save(img_byte_arr, format='JPEG')
     b64_data = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
 
-    # Prompt renforcé
-    prompt_text = f"""
-    Tu es un convertisseur de données. Analyse cette image d'emploi du temps.
-    EXTRACTION STRICTE POUR LE GROUPE "GB".
+    # On force l'année 2025 pour les dates (janvier/février)
+    current_year = datetime.now().year
+    if datetime.now().month > 8: # Si on est en sept/oct, l'année scolaire commence
+        target_year = current_year + 1 # Janvier sera l'année suivante
+    else:
+        target_year = current_year
 
-    RÈGLES :
-    1. Année des cours : Considère que nous sommes en Janvier/Février 2025 (Année scolaire 2024-2025).
-    2. Lignes : Ignore la ligne du haut si une journée est divisée. Ignore les cases oranges.
-    3. Groupe : Garde uniquement les cours "/GB" ou Tronc Commun (sans groupe). Ignore "/GC".
-    4. Créneaux : Les lignes verticales sont des pas de 15min. Début 7h45.
-    5. Profs : Utilise ce mapping : {PROFS_DICT}
+    prompt = f"""
+    Analyse cet emploi du temps (image) pour le groupe "GB".
+    
+    CONTEXTE:
+    - Année : {target_year}
+    - Ignore les cours du groupe "GC".
+    - Ignore les lignes supérieures si une journée est coupée en deux.
+    - Ignore les cases ORANGE.
+    - Les heures : Lignes verticales = 15min. Début journée 07h45.
+    - Profs : Utilise ce mapping : {PROFS_DICT}
 
-    SORTIE :
-    Donne MOI UNIQUEMENT le code ICS valide. 
-    Pas de ```, pas de phrase d'intro.
-    Format:
-    BEGIN:VEVENT
-    SUMMARY:Matière (Prof)
-    DTSTART:20250112T074500
-    DTEND:20250112T094500
-    LOCATION:Salle
-    DESCRIPTION:Groupe GB
-    END:VEVENT
+    TACHE :
+    Extrais les cours sous forme de liste JSON stricte.
+    Format attendu :
+    [
+      {{
+        "date": "JJ/MM/AAAA",
+        "start": "HH:MM",
+        "end": "HH:MM",
+        "summary": "Nom du cours + Prof",
+        "location": "Salle (carré vert)"
+      }}
+    ]
+    
+    Exemple de date : Si tu vois "Lundi 12/janv", mets "12/01/{target_year}".
     """
 
     payload = {
-        "contents": [{"parts": [{"text": prompt_text}, {"inline_data": {"mime_type": "image/jpeg", "data": b64_data}}]}],
-        # AJOUT CRUCIAL : Désactivation des sécurités qui bloquent souvent les emplois du temps
+        "contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": b64_data}}]}],
+        "generationConfig": {"response_mime_type": "application/json"}, # Force le JSON
         "safetySettings": [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+             {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+             {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+             {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+             {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
         ]
     }
 
@@ -90,61 +89,79 @@ def get_gemini_response(image, model_name):
     response = requests.post(url, headers=headers, data=json.dumps(payload))
 
     if response.status_code != 200:
-        print(f"❌ ERREUR HTTP {response.status_code}: {response.text}")
-        return ""
+        print(f"Erreur API: {response.text}")
+        return []
 
-    data = response.json()
-    
-    # DEBUG : Vérifier pourquoi l'IA ne répond pas si c'est vide
-    if 'candidates' not in data or not data['candidates']:
-        print(f"⚠️ AUCUN CANDIDAT GÉNÉRÉ. Réponse brute : {data}")
-        # Souvent dû à un finishReason: SAFETY ou RECITATION
-        return ""
-    
     try:
-        text = data['candidates'][0]['content']['parts'][0]['text']
-        print(f"✅ Texte généré (longueur): {len(text)} caractères")
-        return text
-    except KeyError:
-        print(f"⚠️ Erreur structure JSON : {data}")
-        return ""
+        raw_text = response.json()['candidates'][0]['content']['parts'][0]['text']
+        clean_text = clean_json_text(raw_text)
+        return json.loads(clean_text)
+    except Exception as e:
+        print(f"Erreur parsing JSON: {e}")
+        print(f"Texte reçu: {raw_text if 'raw_text' in locals() else 'Rien'}")
+        return []
+
+def create_ics_file(events):
+    ics_content = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//STRI//Groupe GB//FR",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH"
+    ]
+    
+    for event in events:
+        try:
+            # Conversion date format JJ/MM/AAAA vers YYYYMMDD
+            d_parts = event['date'].split('/')
+            date_str = f"{d_parts[2]}{d_parts[1]}{d_parts[0]}"
+            
+            # Conversion heure HH:MM vers HHMMSS
+            start_str = event['start'].replace(':', '') + "00"
+            end_str = event['end'].replace(':', '') + "00"
+            
+            ics_content.append("BEGIN:VEVENT")
+            ics_content.append(f"DTSTART:{date_str}T{start_str}")
+            ics_content.append(f"DTEND:{date_str}T{end_str}")
+            ics_content.append(f"SUMMARY:{event['summary']}")
+            if event.get('location'):
+                ics_content.append(f"LOCATION:{event['location']}")
+            ics_content.append("DESCRIPTION:Groupe GB - Généré par IA")
+            ics_content.append("END:VEVENT")
+        except Exception as e:
+            print(f"Event ignoré (données invalides) : {event} - {e}")
+            continue
+
+    ics_content.append("END:VCALENDAR")
+    return "\n".join(ics_content)
 
 def main():
     if not API_KEY:
         raise Exception("Clé API manquante")
 
-    print("Recherche modèle...")
-    best_model = find_best_model()
-    print(f"Modèle utilisé : {best_model}")
-
-    print("Téléchargement PDF...")
+    print("Téléchargement du PDF...")
     response = requests.get(PDF_URL)
     images = convert_from_bytes(response.content)
-
-    # En-tête ICS
-    full_ics = "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//STRI//Groupe GB//FR\nCALSCALE:GREGORIAN\n"
     
+    all_events = []
+
     print(f"Traitement de {len(images)} pages...")
     for i, img in enumerate(images):
-        print(f"--- Page {i+1} ---")
-        ics_part = get_gemini_response(img, best_model)
-        
-        # Nettoyage brutal pour ne garder que les VEVENT
-        lines = ics_part.splitlines()
-        for line in lines:
-            line = line.strip()
-            if "BEGIN:VEVENT" in line or "END:VEVENT" in line or "DTSTART" in line or "DTEND" in line or "SUMMARY" in line or "LOCATION" in line or "DESCRIPTION" in line:
-                full_ics += line + "\n"
-            # On accepte aussi les UID et DTSTAMP si générés
-            elif line.startswith("UID:") or line.startswith("DTSTAMP:"):
-                full_ics += line + "\n"
+        print(f"Analyse page {i+1}...")
+        events = get_schedule_from_gemini(img)
+        if events:
+            print(f" -> {len(events)} cours trouvés sur cette page.")
+            all_events.extend(events)
+        else:
+            print(" -> Aucun cours détecté.")
 
-    full_ics += "END:VCALENDAR"
-
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        f.write(full_ics)
+    print("Génération du fichier ICS...")
+    ics_text = create_ics_file(all_events)
     
-    print("Fini.")
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        f.write(ics_text)
+    
+    print("Terminé.")
 
 if __name__ == "__main__":
     main()
