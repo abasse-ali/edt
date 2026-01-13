@@ -25,6 +25,7 @@ RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Th
 """
 
 def get_available_models():
+    """Récupère les modèles dispos."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
     try:
         response = requests.get(url)
@@ -83,7 +84,7 @@ def extract_schedule_with_geometry(image, model_list):
     Analyse cette image d'emploi du temps (multi-semaines).
     ANNÉE : 2026.
 
-    OBJECTIF : Lister TOUS les cours visibles avec leurs COORDONNÉES.
+    OBJECTIF : Lister TOUT ce que tu vois (Matières, Dates) avec leurs COORDONNÉES.
     
     RÈGLES HORAIRES STRICTES (Colonnes) :
     - Col 1 : 07h45 - 09h45
@@ -137,7 +138,7 @@ def extract_schedule_with_geometry(image, model_list):
 
 def geometric_filtering_and_dating(raw_items):
     """
-    Filtre les cours selon la géométrie (Haut/Bas) et les groupes (GA/GB/GC).
+    Filtre STRICTEMENT les cours du HAUT.
     """
     final_events = []
     
@@ -182,6 +183,7 @@ def geometric_filtering_and_dating(raw_items):
         for day_name, day_items in courses_by_day.items():
             if not day_items: continue
             
+            # Calcul de la géométrie de la ligne (Journée entière)
             y_mins = [x['box_2d'][0] for x in day_items]
             y_maxs = [x['box_2d'][2] for x in day_items]
             
@@ -189,42 +191,43 @@ def geometric_filtering_and_dating(raw_items):
             row_bottom = max(y_maxs)
             row_height = row_bottom - row_top
             row_center = (row_top + row_bottom) / 2
+            
+            # Marge de tolérance (10%)
             buffer = row_height * 0.1 
             
             for c in day_items:
                 c_center = (c['box_2d'][0] + c['box_2d'][2]) / 2
                 summary = c.get('summary', '').upper()
                 
-                # 1. FILTRE GROUPE INTERDIT (GA)
-                if "/GA" in summary or "(GA)" in summary or "/ GA" in summary:
-                     # print(f"         🗑️ Rejet (Tag GA): {summary}")
+                # 1. FILTRE GÉOMÉTRIQUE STRICT (HAUT = POUBELLE)
+                # Si le centre du cours est au-dessus du centre de la ligne -> REJET INCONDITIONNEL
+                if c_center < (row_center - buffer):
+                    print(f"         🗑️ Rejet STRICT (Position HAUT): {c.get('summary')}")
+                    continue
+
+                # 2. FILTRE GROUPE INTERDIT (GA) - Sécurité supplémentaire
+                # Si GA est mentionné explicitement, on jette aussi (même si position basse, ce qui serait bizarre)
+                if re.search(r'(\b|/|\()GA\b', summary):
+                     print(f"         🗑️ Rejet (Tag GA): {c.get('summary')}")
                      continue
 
-                # 2. FILTRE GÉOMÉTRIQUE (HAUT)
-                # Si le cours est en haut
-                if c_center < (row_center - buffer):
-                    # On rejette SI ce n'est pas marqué GB ou GC
-                    if "GB" not in summary and "GC" not in summary:
-                        print(f"         🗑️ Rejet (Position HAUT): {c.get('summary')}")
-                        continue
-                
                 # 3. TAGGING POUR DISTINCTION (GC / GB)
                 prefix = ""
-                if "GC" in summary:
+                if re.search(r'(\b|/|\()GC\b', summary):
                     prefix = "[GC] "
-                elif "GB" in summary:
+                elif re.search(r'(\b|/|\()GB\b', summary):
                     prefix = "[GB] "
                 
-                # Nettoyage visuel du summary pour l'agenda
-                # On évite de dupliquer si déjà présent
+                # Application du tag
                 original_summary = c.get('summary', '')
                 if prefix and not original_summary.startswith("["):
                      c['summary'] = prefix + original_summary
 
-                # 4. FILTRE SPORT (Sécurité)
+                # 4. FILTRE SPORT (Sécurité couleur)
                 if "SPORT" in summary and "EXAMEN" not in summary:
                     continue
 
+                # Datation
                 day_offset = days.index(day_name)
                 dt = datetime.strptime(week_start_str, "%Y-%m-%d") + timedelta(days=day_offset)
                 c['real_date'] = dt.strftime("%Y-%m-%d")
