@@ -22,23 +22,20 @@ RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Th
 """
 
 def get_available_models():
-    """Récupère la liste de TOUS les modèles disponibles pour votre clé."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
     try:
         response = requests.get(url)
-        if response.status_code != 200:
-            return []
-        data = response.json()
-        return [m['name'].replace('models/', '') for m in data.get('models', [])]
-    except:
-        return []
+        if response.status_code != 200: return []
+        return [m['name'].replace('models/', '') for m in response.json().get('models', [])]
+    except: return []
 
 def clean_json_text(text):
+    # Nettoyage robuste
+    text = re.sub(r"```json|```", "", text).strip()
     start = text.find('[')
     end = text.rfind(']')
     if start != -1 and end != -1:
         return text[start:end+1]
-    text = re.sub(r"```json|```", "", text).strip()
     return text
 
 def call_gemini_api(image, model_name):
@@ -49,18 +46,34 @@ def call_gemini_api(image, model_name):
     b64_data = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
 
     prompt = f"""
-    Analyse l'emploi du temps (Groupe GB).
+    Tu es un expert en lecture d'emploi du temps complexe.
+    TACHE : Extraire les cours pour le groupe "GB".
     ANNÉE : 2026.
 
-    RÈGLES VISUELLES :
-    1. **LIGNES** : Si une journée a 2 lignes, IGNORE celle du HAUT (GA). LIS celle du BAS (GB).
-    2. **COULEUR** : IGNORE les cases ORANGES. Lis les BLANCHES.
-    3. **GROUPE** : Garde uniquement "/GB" ou sans groupe.
-    4. **HORAIRES** :
-       - Matin : 07h45-09h45 / 10h00-12h00
-       - Aprèm : 13h30-15h30 / 15h45-17h45 (décalage possible)
+    RÈGLES DE LECTURE GÉOMÉTRIQUE (CRITIQUE) :
+    1. **LECTURE LIGNE PAR LIGNE** : 
+       - Repère le jour à gauche (ex: "Lundi").
+       - Lis UNIQUEMENT les cases alignées horizontalement avec ce jour.
+       - NE SAUTE PAS de lignes, ne mélange pas les jours.
 
-    FORMAT DE SORTIE (Liste JSON) :
+    2. **SOUS-LIGNES (HAUT/BAS)** :
+       - Sur une même journée, il y a souvent deux lignes de cours superposées.
+       - Ligne du HAUT = Groupe GA/G1 -> **IGNORER**.
+       - Ligne du BAS = Groupe GB/G2 -> **C'EST TA CIBLE (GARDER)**.
+       - Si une seule ligne centrée -> Garder (Cours commun).
+
+    3. **COULEURS (ATTENTION)** :
+       - Case **JAUNE** = **EXAMEN** -> GARDER IMPÉRATIVEMENT (Ajoute "[EXAMEN]" dans le titre).
+       - Case **ORANGE** = INFO ADMIN/ANNULÉ -> **IGNORER/JETER**.
+       - Case BLANCHE = COURS NORMAL -> GARDER.
+
+    4. **HORAIRES** :
+       - Col 1 : 07h45 - 09h45
+       - Col 2 : 10h00 - 12h00
+       - Col 3 : **13h30** - 15h30 (Commence à la 2ème graduation après 13h)
+       - Col 4 : 15h45 - 17h45
+
+    FORMAT DE SORTIE (JSON LIST) :
     [
       {{
         "date": "2026-MM-JJ",
@@ -70,7 +83,7 @@ def call_gemini_api(image, model_name):
         "location": "Salle"
       }}
     ]
-    Profs: {PROFS_DICT}
+    Utilise ce dictionnaire pour les profs : {PROFS_DICT}
     """
 
     payload = {
@@ -87,32 +100,25 @@ def call_gemini_api(image, model_name):
     return requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
 
 def get_schedule_robust(image):
-    # 1. On récupère ce qu'on a le droit d'utiliser
     available = get_available_models()
     
-    # 2. LISTE DE PRIORITÉ (Cascading Failover)
-    # On commence par le plus intelligent (2.0), si ça bloque -> 1.5 Flash (Fiable) -> etc.
+    # NOUVELLE LISTE DE PRIORITÉ (On vise les modèles "Pro" pour l'intelligence spatiale)
     priority_list = [
-        "gemini-2.0-flash",       # Intelligent mais quota faible
-        "gemini-1.5-flash",       # Le "tank" : quota énorme (15 RPM)
-        "gemini-flash-latest",    # Alias pour 1.5 Flash
-        "gemini-1.5-pro",         # Lent mais précis
-        "gemini-2.0-flash-lite-preview-02-05"
+        "gemini-2.5-pro",         # Le plus puissant (si dispo)
+        "gemini-1.5-pro",         # Très bon en layout
+        "gemini-1.5-pro-latest",
+        "gemini-2.0-flash",       # Rapide mais parfois 429
+        "gemini-1.5-flash",       # Le "tank" de secours
+        "gemini-flash-latest"
     ]
 
-    # On filtre pour ne garder que ceux qui existent vraiment pour votre clé
     models_to_try = [m for m in priority_list if m in available]
-    
-    # Si la liste est vide (erreur API models), on force une liste par défaut
-    if not models_to_try:
-        models_to_try = ["gemini-1.5-flash", "gemini-flash-latest"]
+    if not models_to_try: models_to_try = ["gemini-1.5-flash", "gemini-flash-latest"]
 
-    print(f"   📋 Stratégie de secours : {models_to_try}")
+    print(f"   📋 Stratégie : {models_to_try}")
 
     for model in models_to_try:
         print(f"   👉 Tentative avec : {model}...")
-        
-        # Une seule tentative par modèle (pas de retry si 429, on change direct de modèle)
         try:
             response = call_gemini_api(image, model)
 
@@ -125,21 +131,20 @@ def get_schedule_robust(image):
                     print("      ⚠️ Réponse vide.")
             
             elif response.status_code == 429:
-                print("      ⚠️ Quota dépassé (429). Passage immédiat au modèle suivant...")
-                continue # On passe au prochain modèle de la liste
-            
-            elif response.status_code == 503:
-                print("      ⚠️ Surcharge Google (503). Passage au suivant...")
+                print("      ⚠️ Quota dépassé (429). Suivant...")
                 continue
-
+            elif response.status_code == 503:
+                print("      ⚠️ Surcharge (503). Suivant...")
+                continue
             else:
                 print(f"      ❌ Erreur {response.status_code}.")
+                continue
 
         except Exception as e:
             print(f"      ❌ Exception : {e}")
             continue
 
-    print("❌ ECHEC TOTAL : Aucun modèle n'a fonctionné.")
+    print("❌ ECHEC TOTAL : Aucun modèle n'a réussi.")
     return []
 
 def create_ics_file(events):
@@ -150,24 +155,29 @@ def create_ics_file(events):
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH"
     ]
-    
     for evt in events:
         try:
             d_clean = evt['date'].replace('-', '')
             s_clean = evt['start'].replace(':', '') + "00"
             e_clean = evt['end'].replace(':', '') + "00"
-            
             if d_clean.startswith("2025"): d_clean = d_clean.replace("2025", "2026", 1)
+
+            # Gestion spécifique EXAMEN
+            summary = evt.get('summary', 'Cours')
+            if "[EXAMEN]" in summary.upper() or "EXAMEN" in summary.upper():
+                priority = "PRIORITY:1" # Haute priorité pour examens
+            else:
+                priority = "PRIORITY:5"
 
             ics.append("BEGIN:VEVENT")
             ics.append(f"DTSTART:{d_clean}T{s_clean}")
             ics.append(f"DTEND:{d_clean}T{e_clean}")
-            ics.append(f"SUMMARY:{evt.get('summary', 'Cours')}")
+            ics.append(f"SUMMARY:{summary}")
             ics.append(f"LOCATION:{evt.get('location', '')}")
+            ics.append(priority)
             ics.append("DESCRIPTION:Groupe GB")
             ics.append("END:VEVENT")
         except: continue
-                
     ics.append("END:VCALENDAR")
     return "\n".join(ics)
 
@@ -177,16 +187,15 @@ def main():
     print("Téléchargement PDF...")
     response = requests.get(PDF_URL)
     
+    # 300 DPI est nécessaire pour voir les différences de couleur (Jaune vs Orange)
     print("Conversion PDF -> Images (300 DPI)...")
     images = convert_from_bytes(response.content, dpi=300) 
 
     all_events = []
-
     print(f"Traitement de {len(images)} pages...")
     for i, img in enumerate(images):
         print(f"--- Analyse Page {i+1} ---")
         page_events = get_schedule_robust(img)
-        
         if page_events:
             print(f"✅ {len(page_events)} cours trouvés.")
             all_events.extend(page_events)
@@ -198,7 +207,6 @@ def main():
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         f.write(ics_content)
-    
     print(f"Terminé. Fichier généré : {OUTPUT_FILE}")
 
 if __name__ == "__main__":
