@@ -22,45 +22,34 @@ RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Th
 """
 
 def get_best_model_name():
-    """Interroge l'API pour trouver le modèle le plus intelligent disponible."""
+    """Cherche le modèle le plus intelligent (Pro) disponible."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
     try:
         response = requests.get(url)
         if response.status_code != 200:
-            print("⚠️ Impossible de lister les modèles. Utilisation du défaut.")
             return "gemini-1.5-flash"
 
         data = response.json()
-        # On nettoie les noms (enlève 'models/')
         available_models = [m['name'].replace('models/', '') for m in data.get('models', [])]
-        print(f"📋 Modèles disponibles pour votre clé : {available_models}")
+        print(f"📋 Modèles disponibles : {available_models}")
 
-        # ORDRE DE PRÉFÉRENCE (Intelligence décroissante)
-        # On veut absolument un modèle 'Pro' pour la lecture complexe, sinon Flash
+        # On veut le PRO pour la géométrie complexe
         preferences = [
-            "gemini-1.5-pro",          # Le top pour la logique
+            "gemini-1.5-pro",
             "gemini-1.5-pro-latest",
             "gemini-1.5-pro-001",
-            "gemini-pro",              # Vieux Pro
-            "gemini-flash-latest",     # Flash stable
-            "gemini-1.5-flash",
-            "gemini-2.0-flash-exp"     # Expérimental
+            "gemini-pro",
+            "gemini-flash-latest" # Repli
         ]
 
         for pref in preferences:
             if pref in available_models:
                 print(f"✅ Modèle SÉLECTIONNÉ : {pref}")
                 return pref
-        
-        # Fallback : le premier qui contient 'flash'
-        for m in available_models:
-            if 'flash' in m:
-                return m
                 
         return "gemini-1.5-flash"
 
-    except Exception as e:
-        print(f"Erreur recherche modèle : {e}")
+    except Exception:
         return "gemini-1.5-flash"
 
 def clean_json_text(text):
@@ -78,28 +67,40 @@ def call_gemini_api(image, model_name):
     image.save(img_byte_arr, format='JPEG')
     b64_data = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
 
-    # PROMPT STRUCTURE PAR JOUR (Pour éviter le mélange des dates)
+    # PROMPT MIS À JOUR (13h30 + Ligne Basse)
     prompt = f"""
-    Tu es un expert en lecture d'emploi du temps.
-    ANALYSE L'IMAGE POUR LE GROUPE "GB".
+    Tu es un expert en extraction d'emploi du temps complexe.
+    CIBLE : Groupe "GB".
     ANNÉE : 2026.
 
-    RÈGLES DE LECTURE CRITIQUES :
-    1. **SÉPARATION DES JOURS** : Lis le tableau ligne par ligne. Ne mélange pas les cours du Lundi avec le Mardi.
-    2. **FILTRE COULEUR** : Si une case est ORANGE/JAUNE/GRIS -> IGNORE-LA TOTALEMENT.
-    3. **FILTRE GROUPE** : Garde uniquement "/GB" ou sans groupe. Jette "/GC", "/GA".
-    4. **HORAIRES** :
-       - Colonne 1 : ~07h45-09h45
-       - Colonne 2 : ~10h00-12h00
-       - Colonne 3 : ~13h45-15h45
-       - Colonne 4 : ~15h45-17h45
+    RÈGLES DE LECTURE GÉOMÉTRIQUE (TRES IMPORTANT) :
+    
+    1. **DIVISION HORIZONTALE (HAUT / BAS)** :
+       Regarde la ligne de chaque jour. Souvent, elle est coupée en deux sous-lignes horizontales.
+       - La sous-ligne du **HAUT** concerne le Groupe 1 (G1/GA). -> **IGNORE TOUT CE QUI EST EN HAUT**.
+       - La sous-ligne du **BAS** concerne le Groupe 2 (GB). -> **LIS UNIQUEMENT LA LIGNE DU BAS**.
+       - Si la ligne n'est pas coupée, c'est un cours commun : garde-le.
 
-    FORMAT DE SORTIE (JSON Dictionnaire) :
+    2. **FILTRE GROUPE** :
+       - Garde uniquement "/GB" ou les cours sans mention de groupe.
+       - Si tu vois "/GC", ignore.
+       - Si tu vois "/GA", ignore.
+
+    3. **FILTRE COULEUR** :
+       - Si le fond de la case est ORANGE/JAUNE -> IGNORE (ce sont des examens ou infos admin).
+       - Lis uniquement les cases à fond BLANC.
+
+    4. **HORAIRES PRÉCIS** :
+       - Colonne 1 : 07h45 - 09h45
+       - Colonne 2 : 10h00 - 12h00
+       - Colonne 3 : **13h30** - 15h30 (Attention : commence à la 2ème graduation après 13h)
+       - Colonne 4 : 15h45 - 17h45
+
+    FORMAT DE SORTIE (JSON par Jour) :
     {{
       "2026-01-12": [
-         {{ "summary": "Matière (Prof)", "start": "07:45", "end": "09:45", "location": "Salle" }}
-      ],
-      "2026-01-13": [ ... ]
+         {{ "summary": "Matière (Prof)", "start": "13:30", "end": "15:30", "location": "Salle" }}
+      ]
     }}
     Remplace les profs par : {PROFS_DICT}
     """
@@ -118,10 +119,8 @@ def call_gemini_api(image, model_name):
     return requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
 
 def get_schedule_robust(image):
-    # 1. On trouve le BON modèle dispo
     model_name = get_best_model_name()
     
-    # 2. On essaie 3 fois en cas d'erreur de quota
     for attempt in range(3):
         try:
             print(f"   👉 Tentative {attempt+1} avec {model_name}...")
@@ -133,7 +132,7 @@ def get_schedule_robust(image):
                     clean = clean_json_text(raw_resp['candidates'][0]['content']['parts'][0]['text'])
                     return json.loads(clean)
                 else:
-                    print("      ⚠️ Réponse vide (IA muette).")
+                    print("      ⚠️ Réponse vide.")
             
             elif response.status_code in [429, 503]:
                 wait = (attempt + 1) * 20
@@ -166,6 +165,10 @@ def create_ics_file(grouped_events):
                 d_clean = date_str.replace('-', '')
                 s_clean = evt['start'].replace(':', '') + "00"
                 e_clean = evt['end'].replace(':', '') + "00"
+                
+                # Sécurité 2026
+                if s_clean.startswith("2025"): s_clean = s_clean.replace("2025", "2026", 1)
+                if e_clean.startswith("2025"): e_clean = e_clean.replace("2025", "2026", 1)
 
                 ics.append("BEGIN:VEVENT")
                 ics.append(f"DTSTART:{d_clean}T{s_clean}")
