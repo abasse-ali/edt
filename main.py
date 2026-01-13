@@ -22,47 +22,6 @@ OM=Olfa MECHI; PA=Patrick AUSTIN; PhA=Philippe ARGUEL; PIL=Pierre LOTTE; PL=Phil
 RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Thierry DESPRATS; TG=Thierry GAYRAUD.
 """
 
-def get_best_model_name():
-    """Sélectionne le modèle avec le meilleur quota gratuit."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
-    try:
-        response = requests.get(url)
-        if response.status_code != 200:
-            return "gemini-flash-latest"
-
-        data = response.json()
-        available = [m['name'].replace('models/', '') for m in data.get('models', []) if 'generateContent' in m.get('supportedGenerationMethods', [])]
-        
-        print(f"📋 Modèles disponibles : {available}")
-
-        # ORDRE DE PRIORITÉ CRUCIAL :
-        # 1. 'gemini-flash-latest' : L'alias stable standard (souvent 1.5 Flash). Gros quota.
-        # 2. 'gemini-1.5-flash' : Le nom technique explicite.
-        # 3. 'gemini-2.5-flash' : Nouvelle version, peut-être bon quota, à tester en repli.
-        preferences = [
-            "gemini-flash-latest",       # PRIORITÉ 1 (C'est celui qu'on veut !)
-            "gemini-1.5-flash",          # PRIORITÉ 2
-            "gemini-1.5-flash-latest",   
-            "gemini-1.5-flash-001",
-            "gemini-2.5-flash",          # Repli possible
-        ]
-
-        for pref in preferences:
-            if pref in available:
-                print(f"✅ Modèle choisi (Quota Max) : {pref}")
-                return pref
-        
-        # Si aucun des favoris n'est là, on prend le premier qui contient 'flash'
-        for m in available:
-            if 'flash' in m and 'exp' not in m and 'preview' not in m:
-                return m
-                
-        return "gemini-flash-latest"
-
-    except Exception as e:
-        print(f"Erreur choix modèle : {e}")
-        return "gemini-flash-latest"
-
 def clean_json_text(text):
     text = re.sub(r"```json|```", "", text).strip()
     start = text.find('[')
@@ -71,7 +30,8 @@ def clean_json_text(text):
         return text[start:end+1]
     return text
 
-def get_schedule_from_gemini(image, model_name):
+def call_gemini_api(image, model_name):
+    """Effectue l'appel API avec gestion des erreurs."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={API_KEY}"
     
     img_byte_arr = io.BytesIO()
@@ -113,32 +73,58 @@ def get_schedule_from_gemini(image, model_name):
         ]
     }
 
-    # RETRY LIMITÉ (On n'insiste pas si c'est cassé pour éviter de bloquer le compte)
-    max_retries = 2
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
-            
-            if response.status_code == 429:
-                print(f"⚠️ Quota dépassé. Attente 30s... (Essai {attempt+1}/{max_retries})")
-                time.sleep(30)
-                continue
-            
-            if response.status_code != 200:
-                print(f"⚠️ Erreur API ({response.status_code}): {response.text}")
-                return []
+    response = requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
+    return response
 
-            raw_resp = response.json()
-            if 'candidates' not in raw_resp or not raw_resp['candidates']:
-                return []
-                
-            clean_text = clean_json_text(raw_resp['candidates'][0]['content']['parts'][0]['text'])
-            return json.loads(clean_text)
-
-        except Exception as e:
-            print(f"Erreur technique: {e}")
-            return []
+def get_schedule_robust(image):
+    """Essaie plusieurs modèles et plusieurs tentatives."""
     
+    # LISTE DE SECOURS (Ordre de préférence)
+    # Si le premier est surchargé (503), on passe au suivant.
+    models_to_try = [
+        "gemini-flash-latest",         # Le standard (souvent surchargé)
+        "gemini-2.0-flash-lite-001",   # Très rapide, infrastructure différente
+        "gemini-2.0-flash",            # Nouvelle version stable
+        "gemini-1.5-flash"             # Le classique
+    ]
+
+    for model in models_to_try:
+        print(f"   👉 Tentative avec le modèle : {model}...")
+        
+        # 3 Essais par modèle
+        for attempt in range(3):
+            try:
+                response = call_gemini_api(image, model)
+
+                # Cas de succès
+                if response.status_code == 200:
+                    raw_resp = response.json()
+                    if 'candidates' in raw_resp and raw_resp['candidates']:
+                        clean = clean_json_text(raw_resp['candidates'][0]['content']['parts'][0]['text'])
+                        return json.loads(clean)
+                    else:
+                        print("      ⚠️ Réponse vide de l'IA (Retry).")
+                
+                # Cas Surcharge (503) ou Quota (429) -> On attend et on réessaie
+                elif response.status_code in [429, 503]:
+                    wait = (attempt + 1) * 10
+                    print(f"      ⚠️ Erreur {response.status_code} (Surcharge/Quota). Attente {wait}s...")
+                    time.sleep(wait)
+                    continue # On réessaie le même modèle
+                
+                # Autre erreur (404, 400) -> On change de modèle immédiatement
+                else:
+                    print(f"      ❌ Erreur fatale {response.status_code} avec ce modèle. Passage au suivant.")
+                    break # Break la boucle retry pour changer de modèle
+
+            except Exception as e:
+                print(f"      ❌ Exception technique : {e}")
+                break
+        
+        # Si on arrive ici sans avoir retourné, c'est que ce modèle a échoué 3 fois.
+        print("   ⚠️ Changement de modèle...")
+
+    print("❌ ECHEC TOTAL : Aucun modèle n'a réussi à lire cette page.")
     return []
 
 def create_ics_file(events):
@@ -167,31 +153,35 @@ def create_ics_file(events):
 def main():
     if not API_KEY: raise Exception("Clé API manquante")
 
-    model_name = get_best_model_name()
-    print(f"🚀 Démarrage avec : {model_name}")
-
     print("Téléchargement PDF...")
     response = requests.get(PDF_URL)
     
-    # DPI 150 : Qualité "Fax". Suffisant pour le texte, très léger pour l'API.
-    print("Conversion PDF -> Images (Mode Ultra-Léger 150 DPI)...")
+    # 150 DPI pour être rapide et léger
+    print("Conversion PDF -> Images (Mode Léger)...")
     images = convert_from_bytes(response.content, dpi=150) 
 
     all_events = []
     print(f"Traitement de {len(images)} pages...")
     
     for i, img in enumerate(images):
-        print(f"Analyse Page {i+1}...")
-        events = get_schedule_from_gemini(img, model_name)
+        print(f"--- Analyse Page {i+1} ---")
+        # Appel de la fonction robuste qui gère les modèles
+        events = get_schedule_robust(img)
+        
         if events:
-            print(f"✅ {len(events)} cours trouvés.")
+            print(f"✅ {len(events)} cours trouvés sur cette page.")
             all_events.extend(events)
         else:
-            print("❌ Aucun cours trouvé.")
+            print("❌ Aucun cours récupéré sur cette page.")
 
+    # Génération ICS même si vide (pour ne pas casser le workflow)
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         f.write(create_ics_file(all_events))
-    print(f"Fini ! Fichier {OUTPUT_FILE} généré.")
+    
+    if all_events:
+        print(f"🎉 Succès ! {len(all_events)} événements écrits dans {OUTPUT_FILE}")
+    else:
+        print(f"⚠️ Terminé, mais le fichier est vide (problème persistant sur toutes les tentatives).")
 
 if __name__ == "__main__":
     main()
