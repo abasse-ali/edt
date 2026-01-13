@@ -7,7 +7,7 @@ import re
 import time
 import numpy as np
 from pdf2image import convert_from_bytes
-from PIL import Image
+from PIL import Image, ImageOps
 from datetime import datetime, timedelta
 
 # --- CONFIGURATION ---
@@ -41,7 +41,7 @@ def clean_json_text(text):
     return text
 
 def preprocess_destructive(pil_image):
-    # Masque Orange -> Noir
+    # Noircissement de l'Orange (Sport) pour suppression
     img_array = np.array(pil_image)
     red_cond = img_array[:, :, 0] > 180
     green_cond = (img_array[:, :, 1] > 100) & (img_array[:, :, 1] < 210)
@@ -58,38 +58,23 @@ def call_gemini(image, model_name, prompt):
     payload = {
         "contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": b64_data}}]}],
         "generationConfig": {"response_mime_type": "application/json"},
-        "safetySettings": [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
-        ]
+        "safetySettings": [{"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"}, {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"}, {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"}, {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}]
     }
     return requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
 
 def extract_schedule_with_geometry(image, model_list):
     prompt = f"""
-    Analyse l'emploi du temps (multi-semaines).
-    OBJECTIF : Lister les cours avec leurs COORDONNÉES et POSITION.
+    Analyse l'emploi du temps (multi-semaines). Année 2026.
+    OBJECTIF : Lister TOUT avec COORDONNÉES.
     
     RÈGLES VISUELLES :
     1. Dates à gauche (ex: 12/janv).
-    2. Fond NOIR = IGNORE.
-    3. Fond JAUNE = EXAMEN.
-    4. **POSITION** : Regarde dans la case. Le texte est-il en HAUT (Groupe A), en BAS (Groupe B) ou MILIEU ?
-
+    2. Couleurs : NOIR = IGNORE, JAUNE = EXAMEN.
+    
     FORMAT JSON :
     [
       {{ "type": "DATE_LABEL", "text": "12/janv", "box_2d": [ymin, xmin, ymax, xmax] }},
-      {{ 
-        "type": "COURSE", 
-        "day_name": "Lundi...", 
-        "summary": "Matière", 
-        "start": "HH:MM", "end": "HH:MM", "location": "Salle", 
-        "box_2d": [ymin, xmin, ymax, xmax], 
-        "position": "HAUT/BAS/MILIEU",
-        "is_exam": true 
-      }}
+      {{ "type": "COURSE", "day_name": "Lundi...", "summary": "Matière", "start": "HH:MM", "end": "HH:MM", "location": "Salle", "box_2d": [ymin, xmin, ymax, xmax], "is_exam": true }}
     ]
     Profs: {PROFS_DICT}
     """
@@ -107,14 +92,18 @@ def extract_schedule_with_geometry(image, model_list):
         except: continue
     return []
 
-def geometric_filtering_and_dating(raw_items):
+def filter_by_slot_duel(raw_items):
+    """
+    FILTRAGE PAR DUEL ET GÉOMÉTRIE STRICTE.
+    """
     final_events = []
     
-    # 1. Structure Semaines
     date_labels = sorted([x for x in raw_items if x['type'] == 'DATE_LABEL'], key=lambda k: k['box_2d'][0])
     courses = [x for x in raw_items if x['type'] == 'COURSE']
+    
     if not date_labels: date_labels = [{'text': '12/janv', 'box_2d': [0, 0, 1000, 0]}]
 
+    # 1. Associer cours aux semaines
     courses_by_week = {i: [] for i in range(len(date_labels))}
     for c in courses:
         c_y = c['box_2d'][0]
@@ -124,109 +113,123 @@ def geometric_filtering_and_dating(raw_items):
             else: break
         if week_idx >= 0: courses_by_week[week_idx].append(c)
 
-    # 2. Traitement Semaine
+    # 2. Traitement par semaine
     for idx, week_courses in courses_by_week.items():
         week_text = date_labels[idx]['text']
         week_start_str = parse_date_string(week_text) or "2026-01-12"
         print(f"      🗓️ Semaine {week_text}...")
-        
-        # Groupement par JOUR
-        days = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"]
-        courses_by_day = {d: [] for d in days}
+
+        # --- A. CALCUL GÉOMÉTRIQUE GLOBAL DE LA SEMAINE PAR JOUR ---
+        # On détermine les limites (Haut/Bas) de chaque ligne "Lundi", "Mardi", etc.
+        day_geoms = {}
+        for day in ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"]:
+            d_items = [c for c in week_courses if day in c.get('day_name', '')]
+            if d_items:
+                y_mins = [x['box_2d'][0] for x in d_items]
+                y_maxs = [x['box_2d'][2] for x in d_items]
+                row_top = min(y_mins)
+                row_bottom = max(y_maxs)
+                row_height = row_bottom - row_top
+                day_geoms[day] = {
+                    'center': (row_top + row_bottom) / 2,
+                    'buffer': row_height * 0.1 # 10% de marge
+                }
+        # -----------------------------------------------------------
+
+        # Grouper par JOUR + HEURE DE DÉBUT
+        slots = {} 
         for c in week_courses:
-            for d in days:
-                if d in c.get('day_name', ''):
-                    courses_by_day[d].append(c)
-                    break
-        
-        # 3. ANALYSE "SMART GRID" PAR JOUR
-        for day_name, day_items in courses_by_day.items():
-            if not day_items: continue
+            day = c.get('day_name', 'Lundi')
+            start_hour = c.get('start', '00:00').split(':')[0]
+            try:
+                h = int(start_hour)
+                if h < 10: slot_key = f"{day}_1"   # Matin 1
+                elif h < 13: slot_key = f"{day}_2" # Matin 2
+                elif h < 15: slot_key = f"{day}_3" # Aprèm 1
+                else: slot_key = f"{day}_4"        # Aprèm 2
+            except: slot_key = f"{day}_unknown"
             
-            # --- A. Détection du Seuil de Division (Split Threshold) ---
-            # On cherche des créneaux horaires avec superpositions pour calibrer la ligne
-            slots = {}
-            for c in day_items:
-                start = c.get('start', '00').split(':')[0]
-                if start not in slots: slots[start] = []
-                slots[start].append(c)
+            if slot_key not in slots: slots[slot_key] = []
+            slots[slot_key].append(c)
             
-            split_thresholds = []
-            for t, items in slots.items():
-                if len(items) >= 2:
-                    # Duel détecté ! Le seuil est entre le HAUT (ymin petit) et le BAS (ymin grand)
-                    items.sort(key=lambda x: x['box_2d'][0])
-                    # Seuil = (Bas du cours haut + Haut du cours bas) / 2
-                    thresh = (items[0]['box_2d'][2] + items[-1]['box_2d'][0]) / 2
-                    split_thresholds.append(thresh)
-            
-            # Calcul du seuil moyen pour la journée
-            if split_thresholds:
-                day_split_line = sum(split_thresholds) / len(split_thresholds)
-                # print(f"         📏 Ligne de flottaison {day_name} : {day_split_line}")
-            else:
-                # Pas de duel ? On estime le milieu de la zone occupée
-                all_ymin = [x['box_2d'][0] for x in day_items]
-                all_ymax = [x['box_2d'][2] for x in day_items]
-                day_split_line = (min(all_ymin) + max(all_ymax)) / 2
-            
-            # --- B. Filtrage ---
-            for c in day_items:
-                summary = c.get('summary', '').upper()
-                c_center = (c['box_2d'][0] + c['box_2d'][2]) / 2
-                pos_tag = c.get('position', 'MILIEU').upper()
-                
-                # 1. Filtres Absolus (Tags/Couleurs)
+        for key, slot_items in slots.items():
+            # Filtre préliminaire : Sport & GA explicite
+            clean_items = []
+            for item in slot_items:
+                summary = item.get('summary', '').upper()
                 if "SPORT" in summary and "EXAMEN" not in summary: continue
-                if "/GA" in summary or re.search(r'\bGA\b', summary): continue
-                
-                # Détection Groupe Cible
-                is_target = False
-                prefix = ""
-                if re.search(r'(\b|/|\()GC\b', summary): 
-                    prefix = "[GC] "
-                    is_target = True
-                elif re.search(r'(\b|/|\()GB\b', summary): 
-                    prefix = "[GB] "
-                    is_target = True
-                
-                if prefix and not c.get('summary', '').startswith("["):
-                    c['summary'] = prefix + c.get('summary', '')
+                if "/GA" in summary or re.search(r'\bGA\b', summary): 
+                    # print(f"         🗑️ Rejet (Tag GA): {summary}")
+                    continue
+                clean_items.append(item)
+            
+            if not clean_items: continue
 
-                # 2. FILTRE GÉOMÉTRIQUE STRICT
-                # Si le centre est Au-dessus de la ligne de flottaison (- marge)
-                # ET ce n'est pas un groupe cible explicite -> POUBELLE
-                margin = 20 # pixels
-                if c_center < (day_split_line - margin):
-                    if not is_target:
-                        print(f"         🗑️ Rejet STRICT HAUT ({summary})")
-                        continue
-                
-                # 3. Sécurité IA (si géométrie ambiguë)
-                if pos_tag == "HAUT" and not is_target:
-                     # Double check : si on est vraiment proche de la ligne, on fait confiance à l'IA
-                     if c_center < day_split_line + margin:
-                         print(f"         🗑️ Rejet IA HAUT ({summary})")
-                         continue
+            winner = None
 
-                # Ajout
-                day_offset = days.index(day_name)
+            # --- SÉLECTION DU GAGNANT ---
+            if len(clean_items) == 1:
+                # CAS UNIQUE : On vérifie quand même la géométrie
+                # Si le cours est unique mais "collé au plafond", c'est un cours GA -> POUBELLE
+                candidate = clean_items[0]
+                day_name = key.split('_')[0]
+                
+                if day_name in day_geoms:
+                    geom = day_geoms[day_name]
+                    c_center = (candidate['box_2d'][0] + candidate['box_2d'][2]) / 2
+                    
+                    # Si le centre du cours est significativement au-dessus du centre de la ligne
+                    if c_center < (geom['center'] - geom['buffer']):
+                        # Exception : Si c'est marqué explicitement GB ou GC, on garde quand même
+                        if "GB" not in candidate.get('summary', '').upper() and "GC" not in candidate.get('summary', '').upper():
+                            print(f"         🗑️ Rejet STRICT (Unique mais HAUT): {candidate.get('summary')}")
+                            continue 
+                
+                winner = candidate
+            else:
+                # CAS DUEL : On trie par Y (Ymin = Haut, Ymax = Bas)
+                clean_items.sort(key=lambda x: x['box_2d'][0]) # Tri croissant Y
+                
+                winner = clean_items[-1] # Le dernier est le plus BAS
+                loser = clean_items[0]   # Le premier est le plus HAUT
+                print(f"         ⚔️ DUEL {key}: Rejet HAUT ({loser['summary']}) / Garde BAS ({winner['summary']})")
+
+            if winner:
+                # Traitement final du gagnant
+                summary = winner.get('summary', '')
+                
+                # Tagging GB/GC
+                if re.search(r'(\b|/|\()GC\b', summary.upper()):
+                    if not summary.startswith("["): summary = "[GC] " + summary
+                elif re.search(r'(\b|/|\()GB\b', summary.upper()):
+                    if not summary.startswith("["): summary = "[GB] " + summary
+                    
+                winner['summary'] = summary
+                
+                # Calcul Date Réelle
+                days = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"]
+                day_offset = 0
+                for i, d in enumerate(days):
+                    if d in winner.get('day_name', ''): 
+                        day_offset = i
+                        break
                 dt = datetime.strptime(week_start_str, "%Y-%m-%d") + timedelta(days=day_offset)
-                c['real_date'] = dt.strftime("%Y-%m-%d")
-                final_events.append(c)
+                winner['real_date'] = dt.strftime("%Y-%m-%d")
+                
+                final_events.append(winner)
 
     return final_events
 
 def parse_date_string(date_str):
     try:
-        clean = date_str.lower().replace("janv", "01").replace("févr", "02").replace("mars", "03").replace("avr", "04").strip()
+        clean = date_str.lower().replace("janv", "01").replace("févr", "02").replace("mars", "03").strip()
         clean = re.sub(r"[^0-9/]", "", clean)
         day, month = clean.split('/')
         return f"2026-{month.zfill(2)}-{day.zfill(2)}"
     except: return None
 
 def create_ics(events):
-    ics = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//STRI//Groupe GB-GC//FR", "CALSCALE:GREGORIAN", "METHOD:PUBLISH"]
+    ics = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//STRI//Groupe GB//FR", "CALSCALE:GREGORIAN", "METHOD:PUBLISH"]
     for evt in events:
         try:
             d = evt['real_date'].replace('-', '')
@@ -243,7 +246,7 @@ def create_ics(events):
             ics.append(f"SUMMARY:{summ}")
             ics.append(f"LOCATION:{evt.get('location', '')}")
             ics.append(f"PRIORITY:{prio}")
-            ics.append("DESCRIPTION:Groupe GB et GC")
+            ics.append("DESCRIPTION:Groupe GB")
             ics.append("END:VEVENT")
         except: continue
     ics.append("END:VCALENDAR")
@@ -267,7 +270,7 @@ def main():
         clean_img = preprocess_destructive(img)
         raw = extract_schedule_with_geometry(clean_img, models)
         if raw:
-            valid = geometric_filtering_and_dating(raw)
+            valid = filter_by_slot_duel(raw)
             all_events.extend(valid)
             print(f"   ✅ {len(valid)} cours validés.")
         else: print("   ❌ Echec.")
