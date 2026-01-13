@@ -38,13 +38,18 @@ jobs:
         run: |
           git config --global user.name 'GitHub Action'
           git config --global user.email 'action@github.com'
-          git add edt.ics
           
-          if git diff --staged --quiet; then
-            echo "Pas de changement."
+          # VÉRIFICATION DE SÉCURITÉ
+          if [ -f edt.ics ]; then
+            git add edt.ics
+            if git diff --staged --quiet; then
+              echo "Pas de changement détecté."
+            else
+              git commit -m "Mise à jour EDT via IA Gemini"
+              git pull --rebase -Xtheirs origin main
+              git push origin main
+            fi
           else
-            git commit -m "Mise à jour EDT via IA Gemini"
-            # Gestion des conflits automatique
-            git pull --rebase -Xtheirs origin main
-            git push origin main
+            echo "ERREUR: Le fichier edt.ics n'a pas été généré."
+            exit 1
           fi
