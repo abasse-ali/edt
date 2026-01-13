@@ -1,6 +1,6 @@
 import os
 import requests
-import google.generativeai as genai
+from google import genai
 from pdf2image import convert_from_bytes
 from datetime import datetime
 
