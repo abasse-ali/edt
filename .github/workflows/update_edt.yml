@@ -2,19 +2,22 @@ name: Update EDT
 
 on:
   schedule:
-    # Tourne tous les jours à 6h00 du matin UTC
     - cron: '0 5 * * *'
-  workflow_dispatch: # Permet de lancer manuellement pour tester
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # Important pour pouvoir push le fichier .ics
+      contents: write
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
+
+      # ÉTAPE CRUCIALE POUR L'IA (Conversion Image)
+      - name: Install Poppler
+        run: sudo apt-get install -y poppler-utils
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -26,6 +29,9 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run parser script
+        env:
+          # On passe la clé API secrète au script ici
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python edt_parser.py
 
       - name: Commit and push changes
@@ -33,17 +39,10 @@ jobs:
           git config --global user.name 'GitHub Action'
           git config --global user.email 'action@github.com'
           git add edt.ics
-          
-          # Vérifie s'il y a des changements préparés
           if git diff --staged --quiet; then
-            echo "Aucun changement à sauvegarder."
+            echo "Pas de changement."
           else
-            git commit -m "Mise à jour automatique EDT"
-            
-            # --- CORRECTION ---
-            # On tire les changements. En cas de conflit sur edt.ics, 
-            # on force l'utilisation de notre version locale (-Xtheirs)
+            git commit -m "Mise à jour EDT via IA"
             git pull --rebase -Xtheirs origin main
-            
             git push origin main
           fi
