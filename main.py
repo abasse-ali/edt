@@ -11,8 +11,6 @@ from datetime import datetime
 PDF_URL = "https://stri.fr/Gestion_STRI/TAV/L3/EDT_STRI1A_L3IRT_TAV.pdf"
 OUTPUT_FILE = "emploi_du_temps.ics"
 API_KEY = os.environ.get("GEMINI_API_KEY")
-
-# Liste des profs
 PROFS_DICT = """
 AnAn=Andréi ANDRÉI; AA=André AOUN; AB=Abdelmalek BENZEKRI; AL=Abir LARABA; BC=Bilal CHEBARO; 
 BTJ=Boris TIOMELA JOU; CC=Cédric CHAMBAULT; CG=Christine GALY; CT=Cédric TEYSSIE; EG=Eric GONNEAU; 
@@ -22,61 +20,86 @@ OM=Olfa MECHI; PA=Patrick AUSTIN; PhA=Philippe ARGUEL; PIL=Pierre LOTTE; PL=Phil
 RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Thierry DESPRATS; TG=Thierry GAYRAUD.
 """
 
+def get_dynamic_model_name():
+    """Interroge l'API pour trouver le modèle disponible pour cette clé."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
+    try:
+        response = requests.get(url)
+        if response.status_code != 200:
+            print(f"⚠️ Impossible de lister les modèles ({response.status_code}).")
+            return "gemini-1.5-flash" # Fallback risqué mais nécessaire si l'API models échoue
+
+        data = response.json()
+        # On récupère juste les noms (ex: "models/gemini-pro")
+        available_models = [m['name'].replace('models/', '') for m in data.get('models', []) if 'generateContent' in m.get('supportedGenerationMethods', [])]
+        
+        print(f"📋 Modèles disponibles pour votre clé : {available_models}")
+
+        # Ordre de préférence (du plus performant/récent au plus vieux)
+        preferences = [
+            "gemini-1.5-pro-latest",
+            "gemini-1.5-pro",
+            "gemini-1.5-pro-001",
+            "gemini-1.5-flash-latest",
+            "gemini-1.5-flash",
+            "gemini-1.5-flash-001",
+            "gemini-2.0-flash-exp",
+            "gemini-1.0-pro-vision-latest", # Vieux modèle vision
+            "gemini-pro-vision"
+        ]
+
+        for pref in preferences:
+            if pref in available_models:
+                print(f"✅ Modèle sélectionné : {pref}")
+                return pref
+        
+        # Si aucun favori n'est trouvé, on prend le premier qui a "gemini"
+        if available_models:
+            return available_models[0]
+            
+        return "gemini-1.5-flash"
+
+    except Exception as e:
+        print(f"Erreur détection modèle : {e}")
+        return "gemini-1.5-flash"
+
 def clean_json_text(text):
-    """Nettoie le texte pour extraire uniquement le JSON valide."""
-    # Enlève les balises markdown ```json ... ```
     text = re.sub(r"```json|```", "", text).strip()
-    # Trouve le début et la fin de la liste JSON [...]
     start = text.find('[')
     end = text.rfind(']')
     if start != -1 and end != -1:
         return text[start:end+1]
     return text
 
-def get_schedule_from_gemini(image):
-    # On tente le modèle 'gemini-1.5-flash' qui est rapide et souvent dispo. 
-    # Si celui-ci échoue en 404, changez pour 'gemini-1.5-pro'
-    model_name = "gemini-1.5-flash-latest" 
+def get_schedule_from_gemini(image, model_name):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={API_KEY}"
     
     img_byte_arr = io.BytesIO()
     image.save(img_byte_arr, format='JPEG')
     b64_data = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
 
-    # Année scolaire : Si on est après aout, on assume que l'année commence, sinon c'est la fin
     current_year = datetime.now().year
     
     prompt = f"""
-    Rôle : Tu es un assistant précis qui convertit des images d'emploi du temps en données structurées.
+    Analyse l'emploi du temps (image) pour le groupe "GB".
     
-    TACHE : Analyse cette image pour l'étudiant du groupe "GB" UNIQUEMENT.
-    
-    RÈGLES VISUELLES STRICTES :
-    1.  **Lignes doubles** : Si une journée contient 2 lignes horizontales, REGARDE UNIQUEMENT LA LIGNE DU BAS. Ignore celle du haut.
-    2.  **Filtrage Groupe** : 
-        - Si un cours est marqué "/GC", IGNORE-LE.
-        - Si un cours est marqué "/GB", GARDE-LE.
-        - Si un cours n'a pas de groupe indiqué, GARDE-LE (cours commun).
-    3.  **Grille horaire** : Les lignes verticales marquent 15 minutes. Le début est à 07h45.
-        - 1er créneau standard : ~07h45 - 09h45
-        - 2e créneau standard : ~10h00 - 12h00
-        - 3e créneau standard : ~13h30 - 15h30
-        - 4e créneau standard : ~15h45 - 17h45
-        (Adapte selon la position visuelle exacte).
-    4.  **Dates** : Convertis les dates (ex: "Lundi 12/janv") en format "JJ/MM/AAAA". Utilise l'année {current_year} ou {current_year + 1} selon la logique scolaire.
-    5.  **Profs** : Remplace les initiales (ex: JGT) par {PROFS_DICT}.
-    
-    SORTIE :
-    Retourne UNIQUEMENT une liste JSON. Exemple :
+    RÈGLES VISUELLES :
+    1. Si 2 lignes pour une journée, ignore la ligne du haut.
+    2. Ignore les cours "/GC". Garde "/GB" ou sans groupe.
+    3. Ignore les cases ORANGE.
+    4. Horaires: Lignes verticales = 15min. Début 7h45.
+    5. Profs: {PROFS_DICT}
+
+    SORTIE JSON UNIQUEMENT :
     [
         {{
-            "summary": "Matière (Nom Prof)",
-            "start": "2025-01-12T07:45:00",
-            "end": "2025-01-12T09:45:00",
-            "location": "Salle U3-..."
+            "summary": "Matière (Prof)",
+            "start": "YYYY-MM-DDTHH:MM:00",
+            "end": "YYYY-MM-DDTHH:MM:00",
+            "location": "Salle"
         }}
     ]
-    Si aucun cours n'est trouvé pour le groupe GB, retourne une liste vide [].
+    Utilise l'année {current_year} ou {current_year+1}.
     """
 
     payload = {
@@ -90,91 +113,72 @@ def get_schedule_from_gemini(image):
         ]
     }
 
-    response = requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
-
-    if response.status_code != 200:
-        print(f"Erreur API ({response.status_code}): {response.text}")
-        return []
-
     try:
+        response = requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
+        
+        if response.status_code != 200:
+            print(f"⚠️ Erreur API ({response.status_code}): {response.text}")
+            return []
+
         raw_resp = response.json()
         if 'candidates' not in raw_resp or not raw_resp['candidates']:
-            print("L'IA n'a rien renvoyé (Candidats vides).")
             return []
             
-        raw_text = raw_resp['candidates'][0]['content']['parts'][0]['text']
-        clean_text = clean_json_text(raw_text)
+        clean_text = clean_json_text(raw_resp['candidates'][0]['content']['parts'][0]['text'])
         return json.loads(clean_text)
     except Exception as e:
-        print(f"Erreur lecture JSON : {e}")
-        print(f"Contenu brut reçu : {raw_text if 'raw_text' in locals() else 'Rien'}")
+        print(f"Erreur parsing: {e}")
         return []
 
 def create_ics_file(events):
-    ics_lines = [
+    ics = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
         "PRODID:-//STRI//Groupe GB//FR",
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH"
     ]
-    
     for evt in events:
         try:
-            # Nettoyage des dates pour format ICS (YYYYMMDDTHHMMSS)
-            start_dt = evt['start'].replace('-', '').replace(':', '') 
-            end_dt = evt['end'].replace('-', '').replace(':', '')
-            
-            # Ajout du Z si absent (UTC) ou gestion locale. Ici on reste simple.
-            # Pour être propre en iCal, il vaut mieux éviter les tirets/points
-            
-            ics_lines.append("BEGIN:VEVENT")
-            ics_lines.append(f"DTSTART:{start_dt}")
-            ics_lines.append(f"DTEND:{end_dt}")
-            ics_lines.append(f"SUMMARY:{evt.get('summary', 'Cours')}")
-            if 'location' in evt and evt['location']:
-                ics_lines.append(f"LOCATION:{evt['location']}")
-            ics_lines.append("DESCRIPTION:Groupe GB")
-            ics_lines.append("END:VEVENT")
-        except Exception as e:
-            print(f"Event mal formé ignoré : {evt} ({e})")
-            continue
-
-    ics_lines.append("END:VCALENDAR")
-    return "\n".join(ics_lines)
+            s = evt['start'].replace('-', '').replace(':', '')
+            e = evt['end'].replace('-', '').replace(':', '')
+            ics.append("BEGIN:VEVENT")
+            ics.append(f"DTSTART:{s}")
+            ics.append(f"DTEND:{e}")
+            ics.append(f"SUMMARY:{evt.get('summary', 'Cours')}")
+            ics.append(f"LOCATION:{evt.get('location', '')}")
+            ics.append("DESCRIPTION:Groupe GB")
+            ics.append("END:VEVENT")
+        except: continue
+    ics.append("END:VCALENDAR")
+    return "\n".join(ics)
 
 def main():
-    if not API_KEY:
-        raise Exception("Clé API manquante !")
+    if not API_KEY: raise Exception("Clé API manquante")
 
-    print(f"Téléchargement du PDF...")
+    # 1. On trouve le BON modèle
+    model_name = get_dynamic_model_name()
+    print(f"🚀 Démarrage avec le modèle : {model_name}")
+
+    print("Téléchargement PDF...")
     response = requests.get(PDF_URL)
-    if response.status_code != 200:
-        raise Exception("Erreur téléchargement PDF")
+    images = convert_from_bytes(response.content, dpi=400) # Haute qualité requise
 
-    print("Conversion PDF -> Images (Haute Qualité)...")
-    # DPI=400 est CRUCIAL pour que l'IA lise les petits caractères
-    images = convert_from_bytes(response.content, dpi=400)
-    
     all_events = []
-
     print(f"Traitement de {len(images)} pages...")
+    
     for i, img in enumerate(images):
-        print(f"--- Analyse Page {i+1} ---")
-        events = get_schedule_from_gemini(img)
+        print(f"Analyse Page {i+1}...")
+        events = get_schedule_from_gemini(img, model_name)
         if events:
-            print(f"{len(events)} événements trouvés.")
+            print(f"✅ {len(events)} cours trouvés.")
             all_events.extend(events)
         else:
-            print("Aucun événement détecté sur cette page (ou erreur).")
+            print("❌ Rien trouvé sur cette page.")
 
-    print("Génération du fichier ICS...")
-    ics_content = create_ics_file(all_events)
-    
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        f.write(ics_content)
-    
-    print("Terminé avec succès.")
+        f.write(create_ics_file(all_events))
+    print("Fini.")
 
 if __name__ == "__main__":
     main()
