@@ -4,6 +4,7 @@ import json
 import base64
 import requests
 import re
+import time
 from pdf2image import convert_from_bytes
 from datetime import datetime
 
@@ -11,6 +12,7 @@ from datetime import datetime
 PDF_URL = "https://stri.fr/Gestion_STRI/TAV/L3/EDT_STRI1A_L3IRT_TAV.pdf"
 OUTPUT_FILE = "emploi_du_temps.ics"
 API_KEY = os.environ.get("GEMINI_API_KEY")
+
 PROFS_DICT = """
 AnAn=Andréi ANDRÉI; AA=André AOUN; AB=Abdelmalek BENZEKRI; AL=Abir LARABA; BC=Bilal CHEBARO; 
 BTJ=Boris TIOMELA JOU; CC=Cédric CHAMBAULT; CG=Christine GALY; CT=Cédric TEYSSIE; EG=Eric GONNEAU; 
@@ -21,46 +23,40 @@ RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Th
 """
 
 def get_dynamic_model_name():
-    """Interroge l'API pour trouver le modèle disponible pour cette clé."""
+    """Trouve un modèle STABLE avec un bon quota."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
     try:
         response = requests.get(url)
         if response.status_code != 200:
-            print(f"⚠️ Impossible de lister les modèles ({response.status_code}).")
-            return "gemini-1.5-flash" # Fallback risqué mais nécessaire si l'API models échoue
+            return "gemini-1.5-flash"
 
         data = response.json()
-        # On récupère juste les noms (ex: "models/gemini-pro")
         available_models = [m['name'].replace('models/', '') for m in data.get('models', []) if 'generateContent' in m.get('supportedGenerationMethods', [])]
         
-        print(f"📋 Modèles disponibles pour votre clé : {available_models}")
+        print(f"Modèles dispo : {available_models}")
 
-        # Ordre de préférence (du plus performant/récent au plus vieux)
+        # NOUVEL ORDRE DE PRÉFÉRENCE (Priorité aux modèles stables à haut quota)
         preferences = [
-            "gemini-1.5-pro-latest",
-            "gemini-1.5-pro",
-            "gemini-1.5-pro-001",
+            "gemini-2.0-flash",       # Très rapide, stable, bon quota
+            "gemini-1.5-flash",       # Le standard fiable
             "gemini-1.5-flash-latest",
-            "gemini-1.5-flash",
             "gemini-1.5-flash-001",
-            "gemini-2.0-flash-exp",
-            "gemini-1.0-pro-vision-latest", # Vieux modèle vision
-            "gemini-pro-vision"
+            "gemini-2.0-flash-lite-preview-02-05", # Version légère
+            "gemini-1.5-pro",         # Plus lent mais puissant
         ]
 
         for pref in preferences:
             if pref in available_models:
-                print(f"✅ Modèle sélectionné : {pref}")
+                print(f"Modèle choisi (Stable) : {pref}")
                 return pref
         
-        # Si aucun favori n'est trouvé, on prend le premier qui a "gemini"
+        # Fallback
         if available_models:
             return available_models[0]
-            
         return "gemini-1.5-flash"
 
     except Exception as e:
-        print(f"Erreur détection modèle : {e}")
+        print(f"Erreur choix modèle : {e}")
         return "gemini-1.5-flash"
 
 def clean_json_text(text):
@@ -113,22 +109,35 @@ def get_schedule_from_gemini(image, model_name):
         ]
     }
 
-    try:
-        response = requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
-        
-        if response.status_code != 200:
-            print(f"⚠️ Erreur API ({response.status_code}): {response.text}")
-            return []
-
-        raw_resp = response.json()
-        if 'candidates' not in raw_resp or not raw_resp['candidates']:
-            return []
+    # SYSTÈME DE RETRY (3 essais max)
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
             
-        clean_text = clean_json_text(raw_resp['candidates'][0]['content']['parts'][0]['text'])
-        return json.loads(clean_text)
-    except Exception as e:
-        print(f"Erreur parsing: {e}")
-        return []
+            # Si quota dépassé (429), on attend
+            if response.status_code == 429:
+                wait_time = 40 # secondes
+                print(f"Quota dépassé (429). Pause de {wait_time}s avant nouvel essai ({attempt+1}/{max_retries})...")
+                time.sleep(wait_time)
+                continue
+            
+            if response.status_code != 200:
+                print(f"Erreur API ({response.status_code}): {response.text}")
+                return []
+
+            raw_resp = response.json()
+            if 'candidates' not in raw_resp or not raw_resp['candidates']:
+                return []
+                
+            clean_text = clean_json_text(raw_resp['candidates'][0]['content']['parts'][0]['text'])
+            return json.loads(clean_text)
+
+        except Exception as e:
+            print(f"Erreur technique: {e}")
+            return []
+    
+    return []
 
 def create_ics_file(events):
     ics = [
@@ -156,13 +165,13 @@ def create_ics_file(events):
 def main():
     if not API_KEY: raise Exception("Clé API manquante")
 
-    # 1. On trouve le BON modèle
     model_name = get_dynamic_model_name()
-    print(f"🚀 Démarrage avec le modèle : {model_name}")
+    print(f"Démarrage avec : {model_name}")
 
     print("Téléchargement PDF...")
     response = requests.get(PDF_URL)
-    images = convert_from_bytes(response.content, dpi=400) # Haute qualité requise
+    # DPI 300 est un bon compromis vitesse/qualité pour Flash
+    images = convert_from_bytes(response.content, dpi=300) 
 
     all_events = []
     print(f"Traitement de {len(images)} pages...")
@@ -171,14 +180,14 @@ def main():
         print(f"Analyse Page {i+1}...")
         events = get_schedule_from_gemini(img, model_name)
         if events:
-            print(f"✅ {len(events)} cours trouvés.")
+            print(f"{len(events)} cours trouvés.")
             all_events.extend(events)
         else:
-            print("❌ Rien trouvé sur cette page.")
+            print("Aucun cours trouvé (ou page vide/erreurs).")
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         f.write(create_ics_file(all_events))
-    print("Fini.")
+    print(f"Fini ! Fichier {OUTPUT_FILE} généré.")
 
 if __name__ == "__main__":
     main()
