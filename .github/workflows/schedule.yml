@@ -36,6 +36,9 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python main.py
 
+      - name: Pull latest changes
+        run: git pull origin main --rebase
+        
       - name: Commit and Push changes
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
