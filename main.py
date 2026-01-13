@@ -22,6 +22,7 @@ RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Th
 """
 
 def get_available_models():
+    """Récupère la liste réelle des modèles activés pour votre clé."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
     try:
         response = requests.get(url)
@@ -30,7 +31,6 @@ def get_available_models():
     except: return []
 
 def clean_json_text(text):
-    # Nettoyage robuste
     text = re.sub(r"```json|```", "", text).strip()
     start = text.find('[')
     end = text.rfind(']')
@@ -59,7 +59,7 @@ def call_gemini_api(image, model_name):
     2. **SOUS-LIGNES (HAUT/BAS)** :
        - Sur une même journée, il y a souvent deux lignes de cours superposées.
        - Ligne du HAUT = Groupe GA/G1 -> **IGNORER**.
-       - Ligne du BAS = Groupe GB/G2 -> **C'EST TA CIBLE (GARDER)**.
+       - Ligne du BAS = Groupe GB -> **C'EST TA CIBLE (GARDER)**.
        - Si une seule ligne centrée -> Garder (Cours commun).
 
     3. **COULEURS (ATTENTION)** :
@@ -100,51 +100,76 @@ def call_gemini_api(image, model_name):
     return requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
 
 def get_schedule_robust(image):
-    available = get_available_models()
+    # 1. On récupère les modèles dispos pour votre clé
+    available_in_account = get_available_models()
     
-    # NOUVELLE LISTE DE PRIORITÉ (On vise les modèles "Pro" pour l'intelligence spatiale)
+    # 2. LISTE MASSIVE DE PRIORITÉ (Ordre : Intelligence > Vitesse)
+    # On met tout ce qui peut lire une image.
     priority_list = [
-        "gemini-2.5-pro",         # Le plus puissant (si dispo)
-        "gemini-1.5-pro",         # Très bon en layout
+        # -- TIER 1 : Les cerveaux (Pro) --
+        "gemini-2.5-pro",
+        "gemini-3-pro-preview",
+        "gemini-1.5-pro",
         "gemini-1.5-pro-latest",
-        "gemini-2.0-flash",       # Rapide mais parfois 429
-        "gemini-1.5-flash",       # Le "tank" de secours
-        "gemini-flash-latest"
+        "gemini-exp-1206",
+        
+        # -- TIER 2 : Les rapides équilibrés (Flash) --
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-001",
+        "gemini-flash-latest",     # Souvent le plus fiable en quota
+        "gemini-1.5-flash",
+        
+        # -- TIER 3 : Les légers (Lite) --
+        "gemini-2.0-flash-lite-preview-02-05",
+        "gemini-2.0-flash-lite",
+        "gemini-2.5-flash-lite",
+        
+        # -- TIER 4 : Les expérimentaux --
+        "gemini-pro-latest",
+        "gemini-2.0-flash-exp"
     ]
 
-    models_to_try = [m for m in priority_list if m in available]
-    if not models_to_try: models_to_try = ["gemini-1.5-flash", "gemini-flash-latest"]
+    # On ne garde que ceux qui existent vraiment pour vous
+    models_to_try = [m for m in priority_list if m in available_in_account]
+    
+    # Sécurité si la liste est vide (bug API)
+    if not models_to_try:
+        models_to_try = ["gemini-flash-latest", "gemini-1.5-flash"]
 
-    print(f"   📋 Stratégie : {models_to_try}")
+    print(f"   📋 {len(models_to_try)} modèles prêts à être testés.")
 
+    # BOUCLE DE SURVIE
     for model in models_to_try:
         print(f"   👉 Tentative avec : {model}...")
         try:
             response = call_gemini_api(image, model)
 
+            # SUCCÈS
             if response.status_code == 200:
                 raw_resp = response.json()
                 if 'candidates' in raw_resp and raw_resp['candidates']:
                     clean = clean_json_text(raw_resp['candidates'][0]['content']['parts'][0]['text'])
                     return json.loads(clean)
                 else:
-                    print("      ⚠️ Réponse vide.")
+                    print("      ⚠️ Réponse vide (IA muette). Suivant...")
+                    continue
             
-            elif response.status_code == 429:
-                print("      ⚠️ Quota dépassé (429). Suivant...")
+            # ECHECS TEMPORAIRES (On passe direct au suivant sans attendre)
+            elif response.status_code in [429, 503]:
+                print(f"      ⚠️ Bloqué ({response.status_code}). Suivant immédiat...")
                 continue
-            elif response.status_code == 503:
-                print("      ⚠️ Surcharge (503). Suivant...")
-                continue
+
+            # AUTRES ERREURS
             else:
-                print(f"      ❌ Erreur {response.status_code}.")
+                print(f"      ❌ Erreur {response.status_code}. Suivant...")
                 continue
 
         except Exception as e:
-            print(f"      ❌ Exception : {e}")
+            print(f"      ❌ Exception technique : {e}. Suivant...")
             continue
 
-    print("❌ ECHEC TOTAL : Aucun modèle n'a réussi.")
+    print("❌ ECHEC TOTAL : Tous les modèles ont échoué.")
     return []
 
 def create_ics_file(events):
@@ -162,10 +187,11 @@ def create_ics_file(events):
             e_clean = evt['end'].replace(':', '') + "00"
             if d_clean.startswith("2025"): d_clean = d_clean.replace("2025", "2026", 1)
 
-            # Gestion spécifique EXAMEN
+            # Gestion EXAMEN
             summary = evt.get('summary', 'Cours')
-            if "[EXAMEN]" in summary.upper() or "EXAMEN" in summary.upper():
-                priority = "PRIORITY:1" # Haute priorité pour examens
+            if "EXAMEN" in summary.upper():
+                summary = "🔴 [EXAMEN] " + summary
+                priority = "PRIORITY:1"
             else:
                 priority = "PRIORITY:5"
 
@@ -187,7 +213,6 @@ def main():
     print("Téléchargement PDF...")
     response = requests.get(PDF_URL)
     
-    # 300 DPI est nécessaire pour voir les différences de couleur (Jaune vs Orange)
     print("Conversion PDF -> Images (300 DPI)...")
     images = convert_from_bytes(response.content, dpi=300) 
 
