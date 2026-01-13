@@ -12,7 +12,6 @@ PDF_URL = "https://stri.fr/Gestion_STRI/TAV/L3/EDT_STRI1A_L3IRT_TAV.pdf"
 OUTPUT_FILE = "emploi_du_temps.ics"
 API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Mapping des professeurs (Identique)
 PROFS_DICT = """
 AnAn=Andréi ANDRÉI; AA=André AOUN; AB=Abdelmalek BENZEKRI; AL=Abir LARABA; BC=Bilal CHEBARO; 
 BTJ=Boris TIOMELA JOU; CC=Cédric CHAMBAULT; CG=Christine GALY; CT=Cédric TEYSSIE; EG=Eric GONNEAU; 
@@ -37,28 +36,36 @@ def call_gemini_api(image, model_name):
     image.save(img_byte_arr, format='JPEG')
     b64_data = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
 
-    # PROMPT RENFORCÉ POUR LES HORAIRES ET L'ANNÉE 2026
+    # --- PROMPT RESTRUCTURÉ POUR ÉVITER LES ERREURS DE JOURS ---
     prompt = f"""
-    Tu es un expert en extraction de données d'agenda. Analyse cette image pour le groupe "GB".
+    Tu es un robot de lecture d'emploi du temps. Analyse cette image pixel par pixel.
 
-    RÈGLES ABSOLUES :
-    1. **ANNÉE : 2026**. Toutes les dates doivent être en 2026.
-    2. **GROUPE** : 
-       - GARDE les cours marqués "/GB" ou sans groupe.
-       - JETTE les cours marqués "/GC" ou "/GA".
-    3. **STRUCTURE VISUELLE** :
-       - Si une journée (ligne horizontale) est divisée en deux sous-lignes : IGNORE la ligne du HAUT et les cases ORANGES. Lis UNIQUEMENT la ligne du BAS.
-       - Les petits carrés verts en haut à droite des cases sont les SALLES.
-    
-    4. **HORAIRES PRÉCIS (Attention aux traits verticaux de 15min)** :
-       Le début de la journée est à **07h45**.
-       Calcule les heures de début et fin selon la grille.
-       Les créneaux classiques sont souvent :
-       - Matin : 07h45-09h45 ou 10h00-12h00
-       - Après-midi : 13h30-15h30 (ou 13h45) ou 15h45-17h45
-       *Regarde bien la position des blocs par rapport aux lignes verticales.*
+    CONTEXTE :
+    - Année : **2026** (Force cette année).
+    - Cible : Groupe **"GB"**.
 
-    5. **PROFS** : Remplace les initiales selon : {PROFS_DICT}
+    ALGORITHME DE LECTURE (A SUIVRE STRICTEMENT) :
+    1. **REPÉRAGE DES LIGNES (JOURS)** :
+       - L'image est un tableau. Chaque ligne commence par un Jour (ex: "Lundi 12/janv").
+       - Repère le jour à gauche. TOUS les cours situés à droite sur cette même ligne horizontale appartiennent à CE JOUR précis. Ne mélange pas les lignes.
+       - Si un jour a deux sous-lignes : **IGNORE** la sous-ligne du haut. Lis uniquement celle du BAS.
+
+    2. **FILTRE COULEUR (CRITIQUE)** :
+       - Regarde le fond des cases.
+       - Si le fond est **ORANGE** (ou jaune foncé/grisâtre) : **C'EST INTERDIT**. Jette ce cours immédiatement. Ne l'inclus pas.
+       - Si le fond est BLANC ou clair : C'est OK.
+
+    3. **FILTRE GROUPE** :
+       - Garde uniquement "/GB" ou les cours sans mention de groupe.
+       - Jette "/GC", "/GA".
+
+    4. **HORAIRES** :
+       - Les colonnes représentent les heures.
+       - Les traits verticaux marquent les 15 minutes.
+       - Début journée : 07h45.
+       - Calcule le début et la fin en fonction de la position horizontale de la case.
+
+    5. **PROFS** : {PROFS_DICT}
 
     SORTIE JSON STRICTE :
     [
@@ -85,12 +92,12 @@ def call_gemini_api(image, model_name):
     return requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
 
 def get_schedule_robust(image):
-    """Logique de tentative multiple (Failover) pour contourner les erreurs 429/503."""
+    # On garde gemini-1.5-flash en priorité car il respecte mieux les instructions système complexes que les modèles 'lite'
     models_to_try = [
-        "gemini-1.5-flash",            # Priorité 1 : Le plus stable pour le JSON
-        "gemini-flash-latest",         # Priorité 2
-        "gemini-2.0-flash-lite-preview-02-05", # Priorité 3
-        "gemini-2.0-flash"             # Priorité 4
+        "gemini-1.5-flash",
+        "gemini-flash-latest",
+        "gemini-2.0-flash",
+        "gemini-1.5-pro"
     ]
 
     for model in models_to_try:
@@ -105,7 +112,7 @@ def get_schedule_robust(image):
                         clean = clean_json_text(raw_resp['candidates'][0]['content']['parts'][0]['text'])
                         return json.loads(clean)
                     else:
-                        print("      Réponse vide (IA muette).")
+                        print("      Réponse vide.")
                 
                 elif response.status_code in [429, 503]:
                     wait = (attempt + 1) * 10
@@ -113,14 +120,14 @@ def get_schedule_robust(image):
                     time.sleep(wait)
                     continue
                 else:
-                    print(f"      Erreur {response.status_code}. Passage au modèle suivant.")
+                    print(f"      Erreur {response.status_code}. Suivant.")
                     break 
 
             except Exception as e:
                 print(f"      Exception : {e}")
                 break
         
-    print("ECHEC : Aucun modèle n'a pu lire cette page.")
+    print("ECHEC : Aucun modèle n'a réussi.")
     return []
 
 def create_ics_file(events):
@@ -133,11 +140,10 @@ def create_ics_file(events):
     ]
     for evt in events:
         try:
-            # Nettoyage et formatage
             s = evt['start'].replace('-', '').replace(':', '')
             e = evt['end'].replace('-', '').replace(':', '')
             
-            # Sécurité année 2026 (si l'IA a quand même mis 2025)
+            # Sécurité année 2026
             if s.startswith("2025"): s = s.replace("2025", "2026", 1)
             if e.startswith("2025"): e = e.replace("2025", "2026", 1)
 
@@ -158,9 +164,8 @@ def main():
     print("Téléchargement PDF...")
     response = requests.get(PDF_URL)
     
-    # On remonte à 300 DPI pour que l'IA voie bien les traits de 15min
-    # Si ça plante (quota), redescendez à 200, mais pas 150.
-    print("Conversion PDF -> Images (Qualité Moyenne 300 DPI)...")
+    # 300 DPI pour bien voir les couleurs (Orange vs Blanc)
+    print("Conversion PDF -> Images (300 DPI)...")
     images = convert_from_bytes(response.content, dpi=300) 
 
     all_events = []
@@ -173,7 +178,7 @@ def main():
             print(f"{len(events)} cours trouvés.")
             all_events.extend(events)
         else:
-            print("Aucun cours trouvé sur cette page.")
+            print("Aucun cours trouvé.")
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         f.write(create_ics_file(all_events))
