@@ -21,10 +21,50 @@ OM=Olfa MECHI; PA=Patrick AUSTIN; PhA=Philippe ARGUEL; PIL=Pierre LOTTE; PL=Phil
 RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Thierry DESPRATS; TG=Thierry GAYRAUD.
 """
 
+def get_best_model_name():
+    """Interroge l'API pour trouver le modèle le plus intelligent disponible."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
+    try:
+        response = requests.get(url)
+        if response.status_code != 200:
+            print("⚠️ Impossible de lister les modèles. Utilisation du défaut.")
+            return "gemini-1.5-flash"
+
+        data = response.json()
+        # On nettoie les noms (enlève 'models/')
+        available_models = [m['name'].replace('models/', '') for m in data.get('models', [])]
+        print(f"📋 Modèles disponibles pour votre clé : {available_models}")
+
+        # ORDRE DE PRÉFÉRENCE (Intelligence décroissante)
+        # On veut absolument un modèle 'Pro' pour la lecture complexe, sinon Flash
+        preferences = [
+            "gemini-1.5-pro",          # Le top pour la logique
+            "gemini-1.5-pro-latest",
+            "gemini-1.5-pro-001",
+            "gemini-pro",              # Vieux Pro
+            "gemini-flash-latest",     # Flash stable
+            "gemini-1.5-flash",
+            "gemini-2.0-flash-exp"     # Expérimental
+        ]
+
+        for pref in preferences:
+            if pref in available_models:
+                print(f"✅ Modèle SÉLECTIONNÉ : {pref}")
+                return pref
+        
+        # Fallback : le premier qui contient 'flash'
+        for m in available_models:
+            if 'flash' in m:
+                return m
+                
+        return "gemini-1.5-flash"
+
+    except Exception as e:
+        print(f"Erreur recherche modèle : {e}")
+        return "gemini-1.5-flash"
+
 def clean_json_text(text):
-    # Nettoyage agressif des balises markdown
     text = re.sub(r"```json|```", "", text).strip()
-    # On cherche le premier '{' et le dernier '}' pour attraper l'objet JSON complet
     start = text.find('{')
     end = text.rfind('}')
     if start != -1 and end != -1:
@@ -38,39 +78,30 @@ def call_gemini_api(image, model_name):
     image.save(img_byte_arr, format='JPEG')
     b64_data = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
 
-    # --- PROMPT RESTRUCTURÉ : FORMAT "JOUR PAR JOUR" ---
-    # On demande un dictionnaire par date pour empêcher le mélange des lignes
+    # PROMPT STRUCTURE PAR JOUR (Pour éviter le mélange des dates)
     prompt = f"""
-    Tu es un expert en lecture de grilles complexes.
-    
-    TACHE : Analyse cette image pour le groupe "GB".
-    ANNÉE CIBLE : 2026 (Toutes les dates doivent être en 2026).
+    Tu es un expert en lecture d'emploi du temps.
+    ANALYSE L'IMAGE POUR LE GROUPE "GB".
+    ANNÉE : 2026.
 
-    RÈGLES DE LECTURE SPATIALE (TRES IMPORTANT) :
-    1.  **Lecture Ligne par Ligne** : Repère d'abord la DATE dans la colonne de gauche (ex: "Lundi 12/janv").
-    2.  **Verrouillage Horizontal** : Une fois la date trouvée, déplace-toi vers la droite sur CETTE MÊME LIGNE HORIZONTALE. Ne regarde pas au-dessus, ne regarde pas en dessous.
-    3.  **Lignes doubles** : Si le jour a deux lignes, IGNORE la ligne du haut. Lis UNIQUEMENT la ligne du BAS.
-    4.  **Colonnes** :
-        - 1ère col (après la date) : ~07h45 - 09h45
-        - 2ème col : ~10h00 - 12h00
-        - 3ème col : ~13h45 - 15h45
-        - 4ème col : ~15h45 - 17h45
-    5.  **Filtre Groupe** : Garde seulement "/GB" ou sans groupe. Ignore "/GC", "/GA".
-    6.  **Filtre Couleur** : Ignore STRICTEMENT les cases à fond ORANGE/JAUNE.
-    7.  **Profs** : Utilise ce dictionnaire : {PROFS_DICT}
+    RÈGLES DE LECTURE CRITIQUES :
+    1. **SÉPARATION DES JOURS** : Lis le tableau ligne par ligne. Ne mélange pas les cours du Lundi avec le Mardi.
+    2. **FILTRE COULEUR** : Si une case est ORANGE/JAUNE/GRIS -> IGNORE-LA TOTALEMENT.
+    3. **FILTRE GROUPE** : Garde uniquement "/GB" ou sans groupe. Jette "/GC", "/GA".
+    4. **HORAIRES** :
+       - Colonne 1 : ~07h45-09h45
+       - Colonne 2 : ~10h00-12h00
+       - Colonne 3 : ~13h45-15h45
+       - Colonne 4 : ~15h45-17h45
 
-    FORMAT DE SORTIE ATTENDU (JSON STRUCTURÉ PAR JOUR) :
+    FORMAT DE SORTIE (JSON Dictionnaire) :
     {{
-      "YYYY-MM-DD": [
-         {{
-           "summary": "Matière (Prof)",
-           "start_time": "HH:MM",  (Heure début format 24h)
-           "end_time": "HH:MM",    (Heure fin format 24h)
-           "location": "Salle"
-         }}
-      ]
+      "2026-01-12": [
+         {{ "summary": "Matière (Prof)", "start": "07:45", "end": "09:45", "location": "Salle" }}
+      ],
+      "2026-01-13": [ ... ]
     }}
-    Exemple de clé : "2026-01-12". Ne mets que les jours où il y a cours.
+    Remplace les profs par : {PROFS_DICT}
     """
 
     payload = {
@@ -87,44 +118,37 @@ def call_gemini_api(image, model_name):
     return requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
 
 def get_schedule_robust(image):
-    # ORDRE DE PRIORITÉ CHANGÉ :
-    # 1. gemini-1.5-pro : C'est le SEUL qui lit correctement les lignes complexes sans mélanger.
-    # 2. gemini-1.5-flash : En secours uniquement.
-    models_to_try = [
-        "gemini-1.5-pro",
-        "gemini-1.5-pro-latest",
-        "gemini-1.5-flash" 
-    ]
+    # 1. On trouve le BON modèle dispo
+    model_name = get_best_model_name()
+    
+    # 2. On essaie 3 fois en cas d'erreur de quota
+    for attempt in range(3):
+        try:
+            print(f"   👉 Tentative {attempt+1} avec {model_name}...")
+            response = call_gemini_api(image, model_name)
 
-    for model in models_to_try:
-        print(f"   👉 Analyse avec le modèle : {model}...")
-        for attempt in range(2): # Moins d'essais mais plus ciblés
-            try:
-                response = call_gemini_api(image, model)
-
-                if response.status_code == 200:
-                    raw_resp = response.json()
-                    if 'candidates' in raw_resp and raw_resp['candidates']:
-                        clean = clean_json_text(raw_resp['candidates'][0]['content']['parts'][0]['text'])
-                        return json.loads(clean)
-                    else:
-                        print("      ⚠️ Réponse vide.")
-                
-                elif response.status_code in [429, 503]:
-                    # Le modèle Pro a un quota strict (2 requêtes/min en gratuit).
-                    # On met une pause longue (20s) si on touche la limite.
-                    print(f"      ⚠️ Quota/Surcharge ({response.status_code}). Pause 20s...")
-                    time.sleep(20)
-                    continue
+            if response.status_code == 200:
+                raw_resp = response.json()
+                if 'candidates' in raw_resp and raw_resp['candidates']:
+                    clean = clean_json_text(raw_resp['candidates'][0]['content']['parts'][0]['text'])
+                    return json.loads(clean)
                 else:
-                    print(f"      ❌ Erreur {response.status_code}.")
-                    break 
+                    print("      ⚠️ Réponse vide (IA muette).")
+            
+            elif response.status_code in [429, 503]:
+                wait = (attempt + 1) * 20
+                print(f"      ⚠️ Surcharge ({response.status_code}). Pause {wait}s...")
+                time.sleep(wait)
+                continue
+            else:
+                print(f"      ❌ Erreur {response.status_code}. Stop.")
+                return {}
 
-            except Exception as e:
-                print(f"      ❌ Exception : {e}")
-                break
-        
-    return {} # Retourne un dict vide en cas d'échec total
+        except Exception as e:
+            print(f"      ❌ Exception : {e}")
+            return {}
+            
+    return {}
 
 def create_ics_file(grouped_events):
     ics = [
@@ -135,15 +159,13 @@ def create_ics_file(grouped_events):
         "METHOD:PUBLISH"
     ]
     
-    # On parcourt le dictionnaire par date
     for date_str, courses in grouped_events.items():
         for evt in courses:
             try:
-                # date_str est "YYYY-MM-DD"
-                # evt['start_time'] est "HH:MM"
+                # Format ICS : YYYYMMDDTHHMMSS
                 d_clean = date_str.replace('-', '')
-                s_clean = evt['start_time'].replace(':', '') + "00"
-                e_clean = evt['end_time'].replace(':', '') + "00"
+                s_clean = evt['start'].replace(':', '') + "00"
+                e_clean = evt['end'].replace(':', '') + "00"
 
                 ics.append("BEGIN:VEVENT")
                 ics.append(f"DTSTART:{d_clean}T{s_clean}")
@@ -152,9 +174,7 @@ def create_ics_file(grouped_events):
                 ics.append(f"LOCATION:{evt.get('location', '')}")
                 ics.append("DESCRIPTION:Groupe GB")
                 ics.append("END:VEVENT")
-            except Exception as e:
-                print(f"Erreur création événement : {e} pour {evt}")
-                continue
+            except: continue
                 
     ics.append("END:VCALENDAR")
     return "\n".join(ics)
@@ -172,23 +192,14 @@ def main():
 
     print(f"Traitement de {len(images)} pages...")
     for i, img in enumerate(images):
-        print(f"--- Analyse Page {i+1} (Cela peut prendre 10-15s pour le modèle Pro) ---")
-        
-        # Appel API
+        print(f"--- Analyse Page {i+1} ---")
         page_events = get_schedule_robust(img)
         
         if page_events:
-            print(f"✅ Jours trouvés sur cette page : {list(page_events.keys())}")
+            print(f"✅ Jours trouvés : {list(page_events.keys())}")
             all_grouped_events.update(page_events)
         else:
             print("❌ Echec lecture page.")
-            
-        # PAUSE OBLIGATOIRE POUR LE MODELE PRO (Free Tier)
-        # Le free tier limite à 2 requêtes / minute. 
-        # Si on a plusieurs pages, il faut attendre entre les deux.
-        if i < len(images) - 1:
-            print("⏳ Pause de 30s pour respecter le quota API Pro...")
-            time.sleep(30)
 
     print("Génération ICS...")
     ics_content = create_ics_file(all_grouped_events)
