@@ -7,14 +7,14 @@ import re
 import time
 import numpy as np
 from pdf2image import convert_from_bytes
-from PIL import Image, ImageOps
+from PIL import Image
 from datetime import datetime, timedelta
 
 # --- CONFIGURATION ---
 PDF_URL = "https://stri.fr/Gestion_STRI/TAV/L3/EDT_STRI1A_L3IRT_TAV.pdf"
 OUTPUT_FILE = "emploi_du_temps.ics"
 API_KEY = os.environ.get("GEMINI_API_KEY")
-CONSENSUS_RETRIES = 3 # Nombre de reloads par page
+CONSENSUS_RETRIES = 3 
 
 PROFS_DICT = """
 AnAn=Andréi ANDRÉI; AA=André AOUN; AB=Abdelmalek BENZEKRI; AL=Abir LARABA; BC=Bilal CHEBARO; 
@@ -24,6 +24,14 @@ KB=Ketty BRAVO; LC=Louisa COT; MCL=Marie-Christine LAGASQUIÉ; MM=MUSTAPHA MOJAH
 OM=Olfa MECHI; PA=Patrick AUSTIN; PhA=Philippe ARGUEL; PIL=Pierre LOTTE; PL=Philippe LATU; PT=Patrice TORGUET; 
 RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Thierry DESPRATS; TG=Thierry GAYRAUD.
 """
+
+# Horaires officiels pour caler parfaitement les cours
+OFFICIAL_TIMES = {
+    "1": ("07:45", "09:45"),
+    "2": ("10:00", "12:00"),
+    "3": ("13:30", "15:30"),
+    "4": ("15:45", "17:45")
+}
 
 def get_available_models():
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
@@ -42,8 +50,8 @@ def clean_json_text(text):
     return text
 
 def preprocess_destructive(pil_image):
+    """Transforme l'ORANGE en NOIR (Invisible pour l'IA)."""
     img_array = np.array(pil_image)
-    # ORANGE (#FFB84D)
     red_cond = img_array[:, :, 0] > 180
     green_cond = (img_array[:, :, 1] > 100) & (img_array[:, :, 1] < 210)
     blue_cond = img_array[:, :, 2] < 160
@@ -69,16 +77,17 @@ def extract_schedule_with_geometry(image, model_list):
     Analyse l'emploi du temps (multi-semaines). Année 2026.
     OBJECTIF : Lister TOUT avec COORDONNÉES.
     
-    RÈGLES VISUELLES :
-    1. Dates à gauche (ex: 12/janv).
-    2. Couleurs : NOIR = IGNORE, JAUNE = EXAMEN.
-    
+    RÈGLES CRITIQUES :
+    1. **NOMS PROFS** : Si tu vois des initiales (ex: AA, JGT), REMPLACE-LES par le nom complet (ex: André AOUN) en utilisant la liste ci-dessous.
+    2. **GROUPES** : Si tu vois "Gr A" ou "GA" ou "GC", note-le dans le summary.
+    3. **VISUEL** : NOIR = IGNORE. JAUNE = EXAMEN.
+
     FORMAT JSON :
     [
       {{ "type": "DATE_LABEL", "text": "12/janv", "box_2d": [ymin, xmin, ymax, xmax] }},
-      {{ "type": "COURSE", "day_name": "Lundi...", "summary": "Matière", "start": "HH:MM", "end": "HH:MM", "location": "Salle", "box_2d": [ymin, xmin, ymax, xmax], "is_exam": true }}
+      {{ "type": "COURSE", "day_name": "Lundi...", "summary": "Matière (Nom Prof)", "start": "HH:MM", "end": "HH:MM", "location": "Salle", "box_2d": [ymin, xmin, ymax, xmax], "is_exam": true }}
     ]
-    Profs: {PROFS_DICT}
+    LISTE DES PROFS : {PROFS_DICT}
     """
     for model in model_list:
         print(f"         👉 Tentative avec {model}...")
@@ -96,9 +105,9 @@ def extract_schedule_with_geometry(image, model_list):
 
 def filter_by_slot_duel(raw_items):
     final_events = []
+    
     date_labels = sorted([x for x in raw_items if x['type'] == 'DATE_LABEL'], key=lambda k: k['box_2d'][0])
     courses = [x for x in raw_items if x['type'] == 'COURSE']
-    
     if not date_labels: date_labels = [{'text': '12/janv', 'box_2d': [0, 0, 1000, 0]}]
 
     courses_by_week = {i: [] for i in range(len(date_labels))}
@@ -113,8 +122,9 @@ def filter_by_slot_duel(raw_items):
     for idx, week_courses in courses_by_week.items():
         week_text = date_labels[idx]['text']
         week_start_str = parse_date_string(week_text) or "2026-01-12"
+        print(f"      🗓️ Semaine {week_text}...")
 
-        # Géométrie globale
+        # 1. Calculer la "Zone Interdite" (Haute) pour chaque jour
         day_geoms = {}
         for day in ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"]:
             d_items = [c for c in week_courses if day in c.get('day_name', '')]
@@ -123,24 +133,35 @@ def filter_by_slot_duel(raw_items):
                 y_maxs = [x['box_2d'][2] for x in d_items]
                 row_top = min(y_mins)
                 row_bottom = max(y_maxs)
-                day_geoms[day] = {'center': (row_top + row_bottom) / 2, 'buffer': (row_bottom - row_top) * 0.1}
+                # Le centre de la ligne. Tout ce qui est au-dessus est "HAUT"
+                day_geoms[day] = {
+                    'center': (row_top + row_bottom) / 2,
+                    'buffer': (row_bottom - row_top) * 0.1
+                }
 
-        # Slots
+        # 2. Grouper par créneau
         slots = {} 
         for c in week_courses:
             day = c.get('day_name', 'Lundi')
+            # Identification du Slot (1, 2, 3 ou 4)
             start_hour = c.get('start', '00:00').split(':')[0]
             try:
                 h = int(start_hour)
-                if h < 10: slot_key = f"{day}_1"
-                elif h < 13: slot_key = f"{day}_2"
-                elif h < 15: slot_key = f"{day}_3"
-                else: slot_key = f"{day}_4"
-            except: slot_key = f"{day}_unknown"
+                if h < 10: slot_id = "1"
+                elif h < 13: slot_id = "2"
+                elif h < 15: slot_id = "3"
+                else: slot_id = "4"
+            except: slot_id = "unknown"
+            
+            c['slot_id'] = slot_id # On garde l'ID pour forcer l'heure après
+            slot_key = f"{day}_{slot_id}"
+            
             if slot_key not in slots: slots[slot_key] = []
             slots[slot_key].append(c)
             
+        # 3. Filtrage Strict
         for key, slot_items in slots.items():
+            # Pré-filtre (Sport, GA explicite)
             clean_items = []
             for item in slot_items:
                 summary = item.get('summary', '').upper()
@@ -149,32 +170,47 @@ def filter_by_slot_duel(raw_items):
                 clean_items.append(item)
             
             if not clean_items: continue
+            
+            day_name = key.split('_')[0]
             winner = None
 
+            # CAS A : Un seul cours candidat
             if len(clean_items) == 1:
-                # CAS UNIQUE
                 candidate = clean_items[0]
-                day_name = key.split('_')[0]
+                # Vérification Géométrique STRICTE
                 if day_name in day_geoms:
                     geom = day_geoms[day_name]
                     c_center = (candidate['box_2d'][0] + candidate['box_2d'][2]) / 2
+                    
+                    # Si le cours est dans la moitié HAUTE -> POUBELLE (sauf si GB/GC explicite)
                     if c_center < (geom['center'] - geom['buffer']):
                         if "GB" not in candidate.get('summary', '').upper() and "GC" not in candidate.get('summary', '').upper():
-                            continue 
+                             print(f"         🗑️ Rejet STRICT (Unique mais HAUT): {candidate.get('summary')}")
+                             continue 
                 winner = candidate
-            else:
-                # CAS DUEL
-                clean_items.sort(key=lambda x: x['box_2d'][0]) 
-                winner = clean_items[-1] 
 
+            # CAS B : Duel (Plusieurs cours)
+            else:
+                # Tri par position Y (le plus petit Y est en haut)
+                clean_items.sort(key=lambda x: x['box_2d'][0])
+                winner = clean_items[-1] # On garde le plus BAS
+                print(f"         ⚔️ DUEL {key}: Rejet HAUT ({clean_items[0]['summary']}) / Garde BAS ({winner['summary']})")
+
+            # Finalisation du gagnant
             if winner:
+                # Force l'heure officielle
+                if winner['slot_id'] in OFFICIAL_TIMES:
+                    winner['start'], winner['end'] = OFFICIAL_TIMES[winner['slot_id']]
+
+                # Tagging GB/GC
                 summary = winner.get('summary', '')
-                if re.search(r'(\b|/|\()GC\b', summary.upper()):
-                    if not summary.startswith("["): summary = "[GC] " + summary
-                elif re.search(r'(\b|/|\()GB\b', summary.upper()):
-                    if not summary.startswith("["): summary = "[GB] " + summary
+                if re.search(r'(\b|/|\()GC\b', summary.upper()) and not summary.startswith("["):
+                    summary = "[GC] " + summary
+                elif re.search(r'(\b|/|\()GB\b', summary.upper()) and not summary.startswith("["):
+                    summary = "[GB] " + summary
                 winner['summary'] = summary
                 
+                # Calcul date
                 days = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"]
                 day_offset = 0
                 for i, d in enumerate(days):
@@ -183,6 +219,7 @@ def filter_by_slot_duel(raw_items):
                         break
                 dt = datetime.strptime(week_start_str, "%Y-%m-%d") + timedelta(days=day_offset)
                 winner['real_date'] = dt.strftime("%Y-%m-%d")
+                
                 final_events.append(winner)
 
     return final_events
@@ -195,45 +232,36 @@ def parse_date_string(date_str):
         return f"2026-{month.zfill(2)}-{day.zfill(2)}"
     except: return None
 
-def analyze_page_once(image, models):
-    """Exécute une passe d'extraction complète sur une image."""
-    clean_img = preprocess_destructive(image)
-    raw_items = extract_schedule_with_geometry(clean_img, models)
-    if not raw_items: return []
-    return filter_by_slot_duel(raw_items)
-
 def analyze_page_consensus(image, models):
-    """Lance X analyses et garde les cours présents dans la majorité des résultats."""
     all_runs = []
     print(f"   🔄 Lancement du consensus ({CONSENSUS_RETRIES} runs)...")
-    
     for i in range(CONSENSUS_RETRIES):
         print(f"      👉 Run {i+1}/{CONSENSUS_RETRIES}...")
-        events = analyze_page_once(image, models)
-        all_runs.append(events)
+        clean_img = preprocess_destructive(image)
+        raw = extract_schedule_with_geometry(clean_img, models)
+        if raw:
+            filtered = filter_by_slot_duel(raw)
+            all_runs.append(filtered)
     
-    # Système de vote
+    # Vote majoritaire
     vote_counts = {}
     event_objects = {}
-    
     for run in all_runs:
-        seen_in_run = set()
+        seen = set()
         for evt in run:
             key = (evt['real_date'], evt['start'], evt['end'], evt['summary'].strip())
-            if key in seen_in_run: continue
-            seen_in_run.add(key)
+            if key in seen: continue
+            seen.add(key)
             vote_counts[key] = vote_counts.get(key, 0) + 1
             if key not in event_objects: event_objects[key] = evt
             
     final_list = []
-    threshold = (CONSENSUS_RETRIES // 2) + 1 
-    
+    threshold = (CONSENSUS_RETRIES // 2) + 1
     for key, count in vote_counts.items():
         if count >= threshold:
             final_list.append(event_objects[key])
         else:
             print(f"      🗑️ Rejet Consensus (Vu {count}/{CONSENSUS_RETRIES} fois): {key[3]}")
-            
     return final_list
 
 def create_ics(events):
