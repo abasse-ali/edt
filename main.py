@@ -264,7 +264,7 @@ def analyze_page_consensus(image, models):
         if count >= threshold:
             final_list.append(event_objects[key])
         else:
-            #print(f"      🗑️ Rejet Consensus (Vu {count} fois seulement): {key[3]}")
+            print(f"      🗑️ Rejet Consensus (Vu {count} fois seulement): {key[3]}")
     return final_list
 
 def create_ics(events):
