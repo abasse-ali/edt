@@ -9,12 +9,13 @@ import numpy as np
 from pdf2image import convert_from_bytes
 from PIL import Image
 from datetime import datetime, timedelta
+import statistics
 
 # --- CONFIGURATION ---
 PDF_URL = "https://stri.fr/Gestion_STRI/TAV/L3/EDT_STRI1A_L3IRT_TAV.pdf"
 OUTPUT_FILE = "emploi_du_temps.ics"
 API_KEY = os.environ.get("GEMINI_API_KEY")
-CONSENSUS_RETRIES = 5 # Robustesse maximale
+CONSENSUS_RETRIES = 5
 
 PROFS_DICT = """
 AnAn=Andréi ANDRÉI; AA=André AOUN; AB=Abdelmalek BENZEKRI; AL=Abir LARABA; BC=Bilal CHEBARO; 
@@ -51,9 +52,11 @@ def clean_json_text(text):
 
 def preprocess_destructive(pil_image):
     img_array = np.array(pil_image)
+    # ORANGE (#FFB84D)
     red_cond = img_array[:, :, 0] > 180
     green_cond = (img_array[:, :, 1] > 100) & (img_array[:, :, 1] < 210)
     blue_cond = img_array[:, :, 2] < 160
+    
     mask_orange = red_cond & green_cond & blue_cond
     img_array[mask_orange] = [0, 0, 0]
     return Image.fromarray(img_array)
@@ -77,7 +80,7 @@ def extract_schedule_with_geometry(image, model_list):
     
     RÈGLES CRITIQUES :
     1. **NOMS PROFS** : Si tu vois des initiales (ex: AA, JGT), REMPLACE-LES par le nom complet (ex: André AOUN).
-    2. **GROUPES** : Si tu vois "Gr A" ou "GA" ou "GC", note-le.
+    2. **GROUPES** : Si tu vois "Gr A" ou "GA" ou "GC", note-le DANS LE SUMMARY.
     3. **VISUEL** : NOIR = IGNORE. JAUNE = EXAMEN.
 
     FORMAT JSON :
@@ -122,15 +125,22 @@ def filter_by_slot_duel(raw_items):
         week_start_str = parse_date_string(week_text) or "2026-01-12"
         # print(f"      🗓️ Semaine {week_text}...")
 
+        # --- GÉOMÉTRIE PAR MÉDIANE (Plus robuste) ---
         day_geoms = {}
         for day in ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"]:
             d_items = [c for c in week_courses if day in c.get('day_name', '')]
             if d_items:
                 y_mins = [x['box_2d'][0] for x in d_items]
                 y_maxs = [x['box_2d'][2] for x in d_items]
-                row_top = min(y_mins)
-                row_bottom = max(y_maxs)
-                day_geoms[day] = {'center': (row_top + row_bottom) / 2, 'buffer': (row_bottom - row_top) * 0.1}
+                
+                # Utilisation de la médiane pour ignorer les outliers (grandes cases)
+                row_top = statistics.median(y_mins)
+                row_bottom = statistics.median(y_maxs)
+                
+                day_geoms[day] = {
+                    'center': (row_top + row_bottom) / 2,
+                    'buffer': (row_bottom - row_top) * 0.15 # 15% de marge
+                }
 
         slots = {} 
         for c in week_courses:
@@ -144,8 +154,9 @@ def filter_by_slot_duel(raw_items):
                 else: slot_id = "4"
             except: slot_id = "unknown"
             
-            c['slot_id'] = slot_id 
+            c['slot_id'] = slot_id
             slot_key = f"{day}_{slot_id}"
+            
             if slot_key not in slots: slots[slot_key] = []
             slots[slot_key].append(c)
             
@@ -163,18 +174,24 @@ def filter_by_slot_duel(raw_items):
             winner = None
 
             if len(clean_items) == 1:
+                # CAS UNIQUE
                 candidate = clean_items[0]
                 if day_name in day_geoms:
                     geom = day_geoms[day_name]
                     c_center = (candidate['box_2d'][0] + candidate['box_2d'][2]) / 2
+                    
+                    # FILTRE STRICT (Sauf si GB/GC explicite)
+                    # Si c'est au-dessus du centre médian -> POUBELLE
                     if c_center < (geom['center'] - geom['buffer']):
                         if "GB" not in candidate.get('summary', '').upper() and "GC" not in candidate.get('summary', '').upper():
-                             # REJET STRICT UNIQUE
+                             # print(f"         🗑️ Rejet STRICT (Unique mais HAUT): {candidate.get('summary')}")
                              continue 
                 winner = candidate
             else:
+                # CAS DUEL
                 clean_items.sort(key=lambda x: x['box_2d'][0]) 
-                winner = clean_items[-1] 
+                winner = clean_items[-1] # Le plus bas
+                # print(f"         ⚔️ DUEL {key}: Rejet HAUT ({clean_items[0]['summary']})")
 
             if winner:
                 if winner['slot_id'] in OFFICIAL_TIMES:
@@ -222,21 +239,23 @@ def analyze_page_consensus(image, models):
     vote_counts = {}
     event_objects = {}
     for run in all_runs:
-        seen = set()
+        seen_in_run = set()
         for evt in run:
             key = (evt['real_date'], evt['start'], evt['end'], evt['summary'].strip())
-            if key in seen: continue
-            seen.add(key)
+            if key in seen_in_run: continue
+            seen_in_run.add(key)
             vote_counts[key] = vote_counts.get(key, 0) + 1
             if key not in event_objects: event_objects[key] = evt
             
     final_list = []
-    threshold = (CONSENSUS_RETRIES // 2) + 1
+    # SEUIL BAISSÉ A 2 (pour rattraper les cours difficiles)
+    threshold = max(2, int(CONSENSUS_RETRIES * 0.4)) 
+    
     for key, count in vote_counts.items():
         if count >= threshold:
             final_list.append(event_objects[key])
         else:
-            print(f"      🗑️ Rejet Consensus: {key[3]}")
+            print(f"      🗑️ Rejet Consensus (Vu {count} fois seulement): {key[3]}")
     return final_list
 
 def create_ics(events):
@@ -266,7 +285,7 @@ def create_ics(events):
 def main():
     if not API_KEY: raise Exception("Clé API manquante")
     avail = get_available_models()
-    prio = ["gemini-3-flash-preview", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    prio = ["gemini-3-flash-preview", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-001", "gemini-1.5-flash"]
     models = [m for m in prio if m in avail] or ["gemini-1.5-flash"]
     
     print(f"📋 Modèles : {models}")
