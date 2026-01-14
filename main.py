@@ -133,7 +133,7 @@ def filter_by_slot_duel(raw_items):
                 y_mins = [x['box_2d'][0] for x in d_items]
                 y_maxs = [x['box_2d'][2] for x in d_items]
                 
-                # Utilisation de la médiane pour ignorer les outliers (grandes cases)
+                # Utilisation de la médiane pour ignorer les outliers
                 row_top = statistics.median(y_mins)
                 row_bottom = statistics.median(y_maxs)
                 
@@ -180,18 +180,19 @@ def filter_by_slot_duel(raw_items):
                     geom = day_geoms[day_name]
                     c_center = (candidate['box_2d'][0] + candidate['box_2d'][2]) / 2
                     
-                    # FILTRE STRICT (Sauf si GB/GC explicite)
+                    # FILTRE STRICT ABSOLU (Même si GB, même si Exam/Jaune)
                     # Si c'est au-dessus du centre médian -> POUBELLE
                     if c_center < (geom['center'] - geom['buffer']):
-                        if "GB" not in candidate.get('summary', '').upper() and "GC" not in candidate.get('summary', '').upper():
-                             # print(f"         🗑️ Rejet STRICT (Unique mais HAUT): {candidate.get('summary')}")
+                         if "GB" not in candidate.get('summary', '').upper() and "GC" not in candidate.get('summary', '').upper():
+                             print(f"         ❌ [{key}] REJET STRICT (Unique mais HAUT): {candidate.get('summary')}")
                              continue 
                 winner = candidate
             else:
                 # CAS DUEL
                 clean_items.sort(key=lambda x: x['box_2d'][0]) 
-                winner = clean_items[-1] # Le plus bas
-                # print(f"         ⚔️ DUEL {key}: Rejet HAUT ({clean_items[0]['summary']})")
+                winner = clean_items[-1] # Le plus bas gagne toujours
+                loser = clean_items[0]   # Le plus haut perd toujours
+                print(f"         ⚔️ [{key}] DUEL: REJET HAUT ({loser['summary']}) / GARDE BAS ({winner['summary']})")
 
             if winner:
                 if winner['slot_id'] in OFFICIAL_TIMES:
@@ -248,7 +249,6 @@ def analyze_page_consensus(image, models):
             if key not in event_objects: event_objects[key] = evt
             
     final_list = []
-    # SEUIL BAISSÉ A 2 (pour rattraper les cours difficiles)
     threshold = max(2, int(CONSENSUS_RETRIES * 0.4)) 
     
     for key, count in vote_counts.items():
