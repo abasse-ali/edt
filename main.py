@@ -26,7 +26,7 @@ OM=Olfa MECHI; PA=Patrick AUSTIN; PhA=Philippe ARGUEL; PIL=Pierre LOTTE; PL=Phil
 RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Thierry DESPRATS; TG=Thierry GAYRAUD.
 """
 
-# Official Times
+# Horaires officiels
 OFFICIAL_TIMES = {
     "1": ("07:45", "09:45"),
     "2": ("10:00", "12:00"),
@@ -52,7 +52,7 @@ def clean_json_text(text):
 
 def preprocess_destructive(pil_image):
     img_array = np.array(pil_image)
-    # ORANGE (#FFB84D) - Sport/Cancelled
+    # ORANGE (#FFB84D)
     red_cond = img_array[:, :, 0] > 180
     green_cond = (img_array[:, :, 1] > 100) & (img_array[:, :, 1] < 210)
     blue_cond = img_array[:, :, 2] < 160
@@ -80,7 +80,7 @@ def extract_schedule_with_geometry(image, model_list):
     
     RÈGLES CRITIQUES :
     1. **NOMS PROFS** : Si tu vois des initiales (ex: AA, JGT), REMPLACE-LES par le nom complet (ex: André AOUN).
-    2. **GROUPES** : Si tu vois "Gr A", "GA", "Gr B", "GB", "Gr C", "GC", note-le DANS LE SUMMARY.
+    2. **GROUPES** : Si tu vois "Gr A" ou "GA" ou "GC", note-le DANS LE SUMMARY.
     3. **VISUEL** : NOIR = IGNORE. JAUNE = EXAMEN.
 
     FORMAT JSON :
@@ -111,36 +111,34 @@ def filter_by_slot_duel(raw_items):
     courses = [x for x in raw_items if x['type'] == 'COURSE']
     if not date_labels: date_labels = [{'text': '12/janv', 'box_2d': [0, 0, 1000, 0]}]
 
+    # 1. Calcul de la Hauteur Standard d'un cours (pour l'échelle)
+    all_heights = [c['box_2d'][2] - c['box_2d'][0] for c in courses]
+    STD_H = statistics.median(all_heights) if all_heights else 100
+    
     courses_by_week = {i: [] for i in range(len(date_labels))}
     for c in courses:
         c_y = c['box_2d'][0]
         week_idx = -1
+        # On associe chaque cours à la date qui est juste au-dessus (ou au même niveau)
         for i, lbl in enumerate(date_labels):
-            if c_y >= lbl['box_2d'][0] - 50: week_idx = i
-            else: break
+            # Si le cours est en dessous de la date (avec une marge de 1 cours vers le haut pour l'alignement)
+            if c_y >= lbl['box_2d'][0] - (STD_H * 0.5): 
+                week_idx = i
+            else: 
+                break
         if week_idx >= 0: courses_by_week[week_idx].append(c)
 
     for idx, week_courses in courses_by_week.items():
         week_text = date_labels[idx]['text']
         week_start_str = parse_date_string(week_text) or "2026-01-12"
-
-        # --- GÉOMÉTRIE PAR MÉDIANE (Pour éviter les biais) ---
-        day_geoms = {}
-        for day in ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"]:
-            d_items = [c for c in week_courses if day in c.get('day_name', '')]
-            if d_items:
-                y_mins = [x['box_2d'][0] for x in d_items]
-                y_maxs = [x['box_2d'][2] for x in d_items]
-                
-                # On utilise la médiane pour trouver les bornes "standards" de la journée
-                row_top = statistics.median(y_mins)
-                row_bottom = statistics.median(y_maxs)
-                row_height = row_bottom - row_top
-                
-                # LIGNE DE FLOTTAISON STRICTE : 45% du haut
-                limit_line = row_top + (row_height * 0.45)
-                
-                day_geoms[day] = {'limit': limit_line}
+        
+        # --- ANCRAGE ABSOLU SUR LA DATE ---
+        # Le Y de la date sert de référence 0 pour la semaine
+        REF_Y = date_labels[idx]['box_2d'][0]
+        
+        # Ligne de Coupure : Tout ce qui est à moins de 0.9x la hauteur d'un cours
+        # par rapport à la date est considéré comme la PREMIÈRE LIGNE (Haut/GA).
+        CUTOFF_LINE = REF_Y + (STD_H * 0.9)
 
         slots = {} 
         for c in week_courses:
@@ -156,6 +154,7 @@ def filter_by_slot_duel(raw_items):
             
             c['slot_id'] = slot_id
             slot_key = f"{day}_{slot_id}"
+            
             if slot_key not in slots: slots[slot_key] = []
             slots[slot_key].append(c)
             
@@ -165,38 +164,43 @@ def filter_by_slot_duel(raw_items):
                 summary = item.get('summary', '').upper()
                 if "SPORT" in summary and "EXAMEN" not in summary: continue
                 
-                # REJET TEXTUEL : Si c'est marqué "GA" ou "Gr A", on supprime direct
+                # REJET TEXTUEL GA
                 if re.search(r'(\b|/|\()GA\b', summary) or "GR A" in summary:
-                    #print(f"         🗑️ [{key}] SUPPRESSION TEXTUELLE (Tag GA): {summary}")
+                    # print(f"         🗑️ [{key}] SUPPRESSION TEXTUELLE (Tag GA): {summary}")
                     continue
                 clean_items.append(item)
             
             if not clean_items: continue
             
             winner = None
-            day_name = key.split('_')[0]
-
+            
+            # --- LOGIQUE DE SELECTION ---
             if len(clean_items) == 1:
-                # CAS UNIQUE : Test Géométrique STRICT
+                # CAS UNIQUE : Test Géométrique STRICT vs ANCRAGE
                 candidate = clean_items[0]
-                if day_name in day_geoms:
-                    c_center = (candidate['box_2d'][0] + candidate['box_2d'][2]) / 2
-                    limit = day_geoms[day_name]['limit']
-                    
-                    # SI C'EST EN HAUT -> POUBELLE (Même si GB/GC, Même si Examen)
-                    if c_center < limit:
-                        #print(f"         ❌ [{key}] REJET GÉOMÉTRIQUE STRICT (Haut): {candidate.get('summary')}")
-                        continue
-                    else:
-                        winner = candidate
+                c_center = (candidate['box_2d'][0] + candidate['box_2d'][2]) / 2
+                
+                if c_center < CUTOFF_LINE:
+                    # C'est physiquement en haut (proche de la date) -> SUPPRESSION
+                    # MÊME SI c'est GB ou EXAMEN, si c'est en haut, c'est pour le groupe A.
+                    #print(f"         ❌ [{key}] REJET GÉOMÉTRIQUE (Pos HAUT): {candidate.get('summary')}")
+                    continue
                 else:
-                    winner = candidate # Pas de données géométriques, on garde
+                    winner = candidate # C'est en bas (loin de la date), on garde
 
             else:
                 # CAS DUEL : Le plus bas gagne TOUJOURS
                 clean_items.sort(key=lambda x: x['box_2d'][0]) 
-                winner = clean_items[-1] # Le plus bas (Y le plus grand)
+                winner = clean_items[-1] # Le plus grand Y (le plus bas)
                 loser = clean_items[0]   # Le plus haut
+                
+                # Vérification : Si le "gagnant" (bas) est quand même au-dessus de la ligne de coupure ?
+                # C'est rare (deux cours entassés en haut), mais dans ce cas, le "bas" du haut reste en haut.
+                w_center = (winner['box_2d'][0] + winner['box_2d'][2]) / 2
+                if w_center < CUTOFF_LINE:
+                     #print(f"         ❌ [{key}] DUEL: Les deux sont en HAUT -> Rejet Total")
+                     continue
+
                 #print(f"         ⚔️ [{key}] DUEL: Garde BAS ({winner['summary']}) / Rejet HAUT ({loser['summary']})")
 
             if winner:
@@ -254,7 +258,6 @@ def analyze_page_consensus(image, models):
             if key not in event_objects: event_objects[key] = evt
             
     final_list = []
-    # Seuil Consensus : 2/5 suffisent (40%) pour éviter de perdre des cours limites
     threshold = max(2, int(CONSENSUS_RETRIES * 0.4)) 
     
     for key, count in vote_counts.items():
