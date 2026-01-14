@@ -197,7 +197,7 @@ def filter_by_slot_duel(raw_items):
                 clean_items.sort(key=lambda x: x['box_2d'][0]) 
                 winner = clean_items[-1] # Le plus bas (Y le plus grand)
                 loser = clean_items[0]   # Le plus haut
-                print(f"         ⚔️ [{key}] DUEL: Garde BAS ({winner['summary']}) / Rejet HAUT ({loser['summary']})")
+                #print(f"         ⚔️ [{key}] DUEL: Garde BAS ({winner['summary']}) / Rejet HAUT ({loser['summary']})")
 
             if winner:
                 if winner['slot_id'] in OFFICIAL_TIMES:
@@ -261,7 +261,7 @@ def analyze_page_consensus(image, models):
         if count >= threshold:
             final_list.append(event_objects[key])
         else:
-            print(f"      🗑️ Rejet Consensus (Vu {count} fois seulement): {key[3]}")
+            #print(f"      🗑️ Rejet Consensus (Vu {count} fois seulement): {key[3]}")
     return final_list
 
 def create_ics(events):
