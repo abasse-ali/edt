@@ -26,7 +26,7 @@ OM=Olfa MECHI; PA=Patrick AUSTIN; PhA=Philippe ARGUEL; PIL=Pierre LOTTE; PL=Phil
 RK=Rahim KACIMI; RL=Romain LABORDE; SB=Sonia BADENE; SL=Séverine LALANDE; TD=Thierry DESPRATS; TG=Thierry GAYRAUD.
 """
 
-# Horaires officiels
+# Official Times
 OFFICIAL_TIMES = {
     "1": ("07:45", "09:45"),
     "2": ("10:00", "12:00"),
@@ -52,7 +52,7 @@ def clean_json_text(text):
 
 def preprocess_destructive(pil_image):
     img_array = np.array(pil_image)
-    # ORANGE (#FFB84D)
+    # ORANGE (#FFB84D) - Sport/Cancelled
     red_cond = img_array[:, :, 0] > 180
     green_cond = (img_array[:, :, 1] > 100) & (img_array[:, :, 1] < 210)
     blue_cond = img_array[:, :, 2] < 160
@@ -123,9 +123,8 @@ def filter_by_slot_duel(raw_items):
     for idx, week_courses in courses_by_week.items():
         week_text = date_labels[idx]['text']
         week_start_str = parse_date_string(week_text) or "2026-01-12"
-        # print(f"      🗓️ Semaine {week_text}...")
 
-        # --- GÉOMÉTRIE PAR MÉDIANE (Plus robuste) ---
+        # --- GÉOMÉTRIE PAR MÉDIANE (Pour éviter les biais) ---
         day_geoms = {}
         for day in ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"]:
             d_items = [c for c in week_courses if day in c.get('day_name', '')]
@@ -133,12 +132,12 @@ def filter_by_slot_duel(raw_items):
                 y_mins = [x['box_2d'][0] for x in d_items]
                 y_maxs = [x['box_2d'][2] for x in d_items]
                 
-                # Utilisation de la médiane pour ignorer les outliers
+                # On utilise la médiane pour trouver les bornes "standards" de la journée
                 row_top = statistics.median(y_mins)
                 row_bottom = statistics.median(y_maxs)
                 row_height = row_bottom - row_top
                 
-                # "Ligne de flottaison" : Tout ce qui est au-dessus de 45% de la hauteur est "HAUT"
+                # LIGNE DE FLOTTAISON STRICTE : 45% du haut
                 limit_line = row_top + (row_height * 0.45)
                 
                 day_geoms[day] = {'limit': limit_line}
@@ -157,71 +156,58 @@ def filter_by_slot_duel(raw_items):
             
             c['slot_id'] = slot_id
             slot_key = f"{day}_{slot_id}"
-            
             if slot_key not in slots: slots[slot_key] = []
             slots[slot_key].append(c)
             
         for key, slot_items in slots.items():
-            # Pré-traitement : Nettoyage Sport et GA explicite
             clean_items = []
             for item in slot_items:
                 summary = item.get('summary', '').upper()
+                if "SPORT" in summary and "EXAMEN" not in summary: continue
                 
-                if "SPORT" in summary and "EXAMEN" not in summary: 
-                    continue
-                
-                # REJET DIRECT GA / Gr A (Texte)
+                # REJET TEXTUEL : Si c'est marqué "GA" ou "Gr A", on supprime direct
                 if re.search(r'(\b|/|\()GA\b', summary) or "GR A" in summary:
-                    print(f"         🗑️ [{key}] SUPPRESSION DIRECTE (Tag GA): {summary}")
+                    #print(f"         🗑️ [{key}] SUPPRESSION TEXTUELLE (Tag GA): {summary}")
                     continue
-                    
                 clean_items.append(item)
             
             if not clean_items: continue
             
-            # FILTRAGE GÉOMÉTRIQUE STRICT (S'applique à tout le monde)
-            survivors = []
+            winner = None
             day_name = key.split('_')[0]
-            
-            if day_name in day_geoms:
-                limit = day_geoms[day_name]['limit']
-                for item in clean_items:
-                    c_center = (item['box_2d'][0] + item['box_2d'][2]) / 2
+
+            if len(clean_items) == 1:
+                # CAS UNIQUE : Test Géométrique STRICT
+                candidate = clean_items[0]
+                if day_name in day_geoms:
+                    c_center = (candidate['box_2d'][0] + candidate['box_2d'][2]) / 2
+                    limit = day_geoms[day_name]['limit']
                     
-                    # SI C'EST EN HAUT (0-45%) -> POUBELLE
+                    # SI C'EST EN HAUT -> POUBELLE (Même si GB/GC, Même si Examen)
                     if c_center < limit:
-                        # On log pour vérification, mais on supprime sans pitié
-                        print(f"         ❌ [{key}] GUILLOTINE GÉOMÉTRIQUE (Pos HAUT): {item.get('summary')}")
+                        #print(f"         ❌ [{key}] REJET GÉOMÉTRIQUE STRICT (Haut): {candidate.get('summary')}")
+                        continue
                     else:
-                        survivors.append(item)
+                        winner = candidate
+                else:
+                    winner = candidate # Pas de données géométriques, on garde
+
             else:
-                # Si pas de géométrie (bizarre), on garde tout par défaut
-                survivors = clean_items
+                # CAS DUEL : Le plus bas gagne TOUJOURS
+                clean_items.sort(key=lambda x: x['box_2d'][0]) 
+                winner = clean_items[-1] # Le plus bas (Y le plus grand)
+                loser = clean_items[0]   # Le plus haut
+                print(f"         ⚔️ [{key}] DUEL: Garde BAS ({winner['summary']}) / Rejet HAUT ({loser['summary']})")
 
-            if not survivors: continue
-
-            # SÉLECTION FINALE (S'il reste plusieurs cours en bas)
-            # On prend le plus bas (le dernier après tri)
-            survivors.sort(key=lambda x: x['box_2d'][0]) 
-            winner = survivors[-1]
-            
-            # S'il y a eu un "duel" (plusieurs survivants en bas ? Rare mais possible)
-            if len(survivors) > 1:
-                 print(f"         ⚔️ [{key}] CONFLIT BAS: Vainqueur ({winner['summary']})")
-
-            # VALIDATION DU GAGNANT
             if winner:
                 if winner['slot_id'] in OFFICIAL_TIMES:
                     winner['start'], winner['end'] = OFFICIAL_TIMES[winner['slot_id']]
 
                 summary = winner.get('summary', '')
-                
-                # Standardisation des tags
-                if re.search(r'(\b|/|\()GC\b', summary.upper()) or "GR C" in summary.upper():
-                    if not summary.startswith("["): summary = "[GC] " + summary
-                elif re.search(r'(\b|/|\()GB\b', summary.upper()) or "GR B" in summary.upper():
-                    if not summary.startswith("["): summary = "[GB] " + summary
-                
+                if re.search(r'(\b|/|\()GC\b', summary.upper()) and not summary.startswith("["):
+                    summary = "[GC] " + summary
+                elif re.search(r'(\b|/|\()GB\b', summary.upper()) and not summary.startswith("["):
+                    summary = "[GB] " + summary
                 winner['summary'] = summary
                 
                 days = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"]
@@ -268,6 +254,7 @@ def analyze_page_consensus(image, models):
             if key not in event_objects: event_objects[key] = evt
             
     final_list = []
+    # Seuil Consensus : 2/5 suffisent (40%) pour éviter de perdre des cours limites
     threshold = max(2, int(CONSENSUS_RETRIES * 0.4)) 
     
     for key, count in vote_counts.items():
