@@ -266,7 +266,7 @@ def create_ics(events):
 def main():
     if not API_KEY: raise Exception("Clé API manquante")
     avail = get_available_models()
-    prio = ["gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash-001", "gemini-1.5-pro-latest"]
+    prio = ["gemini-3-flash-preview", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
     models = [m for m in prio if m in avail] or ["gemini-1.5-flash"]
     
     print(f"📋 Modèles : {models}")
