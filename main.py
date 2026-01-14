@@ -80,7 +80,7 @@ def extract_schedule_with_geometry(image, model_list):
     
     RÈGLES CRITIQUES :
     1. **NOMS PROFS** : Si tu vois des initiales (ex: AA, JGT), REMPLACE-LES par le nom complet (ex: André AOUN).
-    2. **GROUPES** : Si tu vois "Gr A" ou "GA" ou "GC", note-le DANS LE SUMMARY.
+    2. **GROUPES** : Si tu vois "Gr A", "GA", "Gr B", "GB", "Gr C", "GC", note-le DANS LE SUMMARY.
     3. **VISUEL** : NOIR = IGNORE. JAUNE = EXAMEN.
 
     FORMAT JSON :
@@ -123,7 +123,7 @@ def filter_by_slot_duel(raw_items):
     for idx, week_courses in courses_by_week.items():
         week_text = date_labels[idx]['text']
         week_start_str = parse_date_string(week_text) or "2026-01-12"
-        print(f"      🗓️ Semaine {week_text}...")
+        # print(f"      🗓️ Semaine {week_text}...")
 
         # --- GÉOMÉTRIE PAR MÉDIANE (Plus robuste) ---
         day_geoms = {}
@@ -136,11 +136,12 @@ def filter_by_slot_duel(raw_items):
                 # Utilisation de la médiane pour ignorer les outliers
                 row_top = statistics.median(y_mins)
                 row_bottom = statistics.median(y_maxs)
+                row_height = row_bottom - row_top
                 
-                day_geoms[day] = {
-                    'center': (row_top + row_bottom) / 2,
-                    'buffer': (row_bottom - row_top) * 0.15 # 15% de marge
-                }
+                # "Ligne de flottaison" : Tout ce qui est au-dessus de 45% de la hauteur est "HAUT"
+                limit_line = row_top + (row_height * 0.45)
+                
+                day_geoms[day] = {'limit': limit_line}
 
         slots = {} 
         for c in week_courses:
@@ -161,48 +162,66 @@ def filter_by_slot_duel(raw_items):
             slots[slot_key].append(c)
             
         for key, slot_items in slots.items():
+            # Pré-traitement : Nettoyage Sport et GA explicite
             clean_items = []
             for item in slot_items:
                 summary = item.get('summary', '').upper()
-                if "SPORT" in summary and "EXAMEN" not in summary: continue
-                if "/GA" in summary or re.search(r'\bGA\b', summary): continue
+                
+                if "SPORT" in summary and "EXAMEN" not in summary: 
+                    continue
+                
+                # REJET DIRECT GA / Gr A (Texte)
+                if re.search(r'(\b|/|\()GA\b', summary) or "GR A" in summary:
+                    print(f"         🗑️ [{key}] SUPPRESSION DIRECTE (Tag GA): {summary}")
+                    continue
+                    
                 clean_items.append(item)
             
             if not clean_items: continue
             
+            # FILTRAGE GÉOMÉTRIQUE STRICT (S'applique à tout le monde)
+            survivors = []
             day_name = key.split('_')[0]
-            winner = None
-
-            if len(clean_items) == 1:
-                # CAS UNIQUE
-                candidate = clean_items[0]
-                if day_name in day_geoms:
-                    geom = day_geoms[day_name]
-                    c_center = (candidate['box_2d'][0] + candidate['box_2d'][2]) / 2
+            
+            if day_name in day_geoms:
+                limit = day_geoms[day_name]['limit']
+                for item in clean_items:
+                    c_center = (item['box_2d'][0] + item['box_2d'][2]) / 2
                     
-                    # FILTRE STRICT ABSOLU (Même si GB, même si Exam/Jaune)
-                    # Si c'est au-dessus du centre médian -> POUBELLE
-                    if c_center < (geom['center'] - geom['buffer']):
-                         if "GB" not in candidate.get('summary', '').upper() and "GC" not in candidate.get('summary', '').upper():
-                             # print(f"         ❌ [{key}] REJET STRICT (Unique mais HAUT): {candidate.get('summary')}")
-                             continue 
-                winner = candidate
+                    # SI C'EST EN HAUT (0-45%) -> POUBELLE
+                    if c_center < limit:
+                        # On log pour vérification, mais on supprime sans pitié
+                        print(f"         ❌ [{key}] GUILLOTINE GÉOMÉTRIQUE (Pos HAUT): {item.get('summary')}")
+                    else:
+                        survivors.append(item)
             else:
-                # CAS DUEL
-                clean_items.sort(key=lambda x: x['box_2d'][0]) 
-                winner = clean_items[-1] # Le plus bas gagne toujours
-                loser = clean_items[0]   # Le plus haut perd toujours
-                # print(f"         ⚔️ [{key}] DUEL: REJET HAUT ({loser['summary']}) / GARDE BAS ({winner['summary']})")
+                # Si pas de géométrie (bizarre), on garde tout par défaut
+                survivors = clean_items
 
+            if not survivors: continue
+
+            # SÉLECTION FINALE (S'il reste plusieurs cours en bas)
+            # On prend le plus bas (le dernier après tri)
+            survivors.sort(key=lambda x: x['box_2d'][0]) 
+            winner = survivors[-1]
+            
+            # S'il y a eu un "duel" (plusieurs survivants en bas ? Rare mais possible)
+            if len(survivors) > 1:
+                 print(f"         ⚔️ [{key}] CONFLIT BAS: Vainqueur ({winner['summary']})")
+
+            # VALIDATION DU GAGNANT
             if winner:
                 if winner['slot_id'] in OFFICIAL_TIMES:
                     winner['start'], winner['end'] = OFFICIAL_TIMES[winner['slot_id']]
 
                 summary = winner.get('summary', '')
-                if re.search(r'(\b|/|\()GC\b', summary.upper()) and not summary.startswith("["):
-                    summary = "[GC] " + summary
-                elif re.search(r'(\b|/|\()GB\b', summary.upper()) and not summary.startswith("["):
-                    summary = "[GB] " + summary
+                
+                # Standardisation des tags
+                if re.search(r'(\b|/|\()GC\b', summary.upper()) or "GR C" in summary.upper():
+                    if not summary.startswith("["): summary = "[GC] " + summary
+                elif re.search(r'(\b|/|\()GB\b', summary.upper()) or "GR B" in summary.upper():
+                    if not summary.startswith("["): summary = "[GB] " + summary
+                
                 winner['summary'] = summary
                 
                 days = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"]
