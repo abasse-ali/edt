@@ -123,7 +123,7 @@ def filter_by_slot_duel(raw_items):
     for idx, week_courses in courses_by_week.items():
         week_text = date_labels[idx]['text']
         week_start_str = parse_date_string(week_text) or "2026-01-12"
-        # print(f"      🗓️ Semaine {week_text}...")
+        print(f"      🗓️ Semaine {week_text}...")
 
         # --- GÉOMÉTRIE PAR MÉDIANE (Plus robuste) ---
         day_geoms = {}
