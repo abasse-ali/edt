@@ -184,7 +184,7 @@ def filter_by_slot_duel(raw_items):
                     # Si c'est au-dessus du centre médian -> POUBELLE
                     if c_center < (geom['center'] - geom['buffer']):
                          if "GB" not in candidate.get('summary', '').upper() and "GC" not in candidate.get('summary', '').upper():
-                             print(f"         ❌ [{key}] REJET STRICT (Unique mais HAUT): {candidate.get('summary')}")
+                             # print(f"         ❌ [{key}] REJET STRICT (Unique mais HAUT): {candidate.get('summary')}")
                              continue 
                 winner = candidate
             else:
@@ -192,7 +192,7 @@ def filter_by_slot_duel(raw_items):
                 clean_items.sort(key=lambda x: x['box_2d'][0]) 
                 winner = clean_items[-1] # Le plus bas gagne toujours
                 loser = clean_items[0]   # Le plus haut perd toujours
-                print(f"         ⚔️ [{key}] DUEL: REJET HAUT ({loser['summary']}) / GARDE BAS ({winner['summary']})")
+                # print(f"         ⚔️ [{key}] DUEL: REJET HAUT ({loser['summary']}) / GARDE BAS ({winner['summary']})")
 
             if winner:
                 if winner['slot_id'] in OFFICIAL_TIMES:
